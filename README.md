@@ -21,13 +21,6 @@ A Linux gaming input remapper with per-game profiles, precise macro timing, and 
 
 See [SUPPORTED_DEVICES.md](SUPPORTED_DEVICES.md) for the full list of tested hardware and notes on requesting support for new devices.
 
----
-
-## Requirements
-
-- Linux (kernel 4.15+)
-- Your user account in the `input` group (the app will offer to set this up for you)
-- `uinput` kernel module loaded (`sudo modprobe uinput`)
 
 ---
 
@@ -74,6 +67,74 @@ gameremap <subcommand>
 4. Alt-tab to your game and play; the editor window can stay open or minimized
 5. Click **Stop** to pause remapping, or close the window to stop everything
 6. Hold **Escape for 7 seconds** at any time to force-quit if the remapper gets stuck
+
+---
+
+## One-Time Permission Setup
+
+GameRemapper needs read access to `/dev/input/event*` (raw input) and write access to `/dev/uinput` and `/dev/hidraw*` (virtual device injection). On first launch the app checks whether it can open these nodes. If it cannot, it prompts you to run a one-time setup via a polkit (pkexec) dialog — no terminal required.
+
+### What the setup does
+
+The embedded setup script runs as root and performs three steps:
+
+1. **Adds your user to the `input` group**
+   ```sh
+   usermod -aG input <your-username>
+   ```
+   You must log out and back in (or reboot) for the group membership to take effect.
+
+2. **Installs a udev rules file** at `/etc/udev/rules.d/99-gameremap.rules`:
+   ```
+   KERNEL=="event*", SUBSYSTEM=="input", GROUP="input", MODE="0660"
+   KERNEL=="uinput",                     GROUP="input", MODE="0660"
+   KERNEL=="hidraw*",                    GROUP="input", MODE="0660"
+   ```
+   These rules set the group owner and permissions on input, uinput, and hidraw nodes so any member of `input` can access them without sudo.
+
+3. **Reloads udev** and re-triggers the input subsystem so the new rules apply to already-present devices immediately:
+   ```sh
+   udevadm control --reload
+   udevadm trigger --subsystem-match=input
+   ```
+
+### Teardown
+
+The teardown option (available in the app settings) reverses step 2 — it deletes `/etc/udev/rules.d/99-gameremap.rules` and reloads udev. It does not remove you from the `input` group; do that manually if desired:
+
+```sh
+sudo gpasswd -d $USER input
+```
+
+### Doing it yourself
+
+If you prefer not to use polkit, or want to apply the setup on a headless machine, run these commands directly:
+
+```sh
+# 1. Add your user to the input group
+sudo usermod -aG input $USER
+
+# 2. Write the udev rules
+sudo tee /etc/udev/rules.d/99-gameremap.rules << 'EOF'
+KERNEL=="event*", SUBSYSTEM=="input", GROUP="input", MODE="0660"
+KERNEL=="uinput",                     GROUP="input", MODE="0660"
+KERNEL=="hidraw*",                    GROUP="input", MODE="0660"
+EOF
+
+# 3. Apply the rules immediately
+sudo udevadm control --reload
+sudo udevadm trigger --subsystem-match=input
+
+# 4. Log out and back in (or reboot) for the group change to take effect
+```
+
+To undo manually:
+```sh
+sudo rm /etc/udev/rules.d/99-gameremap.rules
+sudo udevadm control --reload
+sudo udevadm trigger --subsystem-match=input
+sudo gpasswd -d $USER input   # optional: remove from input group
+```
 
 ---
 
