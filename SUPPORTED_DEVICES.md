@@ -30,4 +30,4 @@ These devices work through evdev as-is. They are listed here because they have b
 
 ## Requesting Support for a New Device
 
-Device coverage is limited to hardware I personally own. If you'd like your device supported, [open a feature request](../../issues). Adding support requires decoding the device's raw HID reports and writing a small driver — the more detail you can provide (HID descriptor, raw report captures via `hid-recorder` or `usbhid-dump`), the faster it can be added.
+Device coverage is limited to hardware I personally own. If you'd like your device supported, [open a feature request](https://github.com/ben-leone/linux-gaming-input-remapper/issues). Adding support requires decoding the device's raw HID reports and writing a small driver — the more detail you can provide (HID descriptor, raw report captures via `hid-recorder` or `usbhid-dump`), the faster it can be added.

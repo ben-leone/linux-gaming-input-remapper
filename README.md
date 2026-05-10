@@ -33,7 +33,7 @@ See [SUPPORTED_DEVICES.md](SUPPORTED_DEVICES.md) for the full list of tested har
 
 ## Getting Started
 
-> Release builds and AppImage downloads will be available on the [Releases](#) page.
+> Release builds and AppImage downloads are available on the [Releases](https://github.com/ben-leone/linux-gaming-input-remapper/releases) page.
 
 To build from source:
 
