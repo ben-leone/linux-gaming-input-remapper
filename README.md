@@ -11,8 +11,7 @@ A Linux gaming input remapper with per-game profiles, precise macro timing, and 
 - **Per-game profiles** — automatically switch remaps when a game launches (Steam and Proton supported)
 - **Macros** — record or hand-craft key sequences with precise millisecond timing; loop them while a button is held
 - **Modifier layers** — hold a key to activate a completely different set of bindings
-- **Extra mouse buttons** — full support for MMO mice and gaming keyboards with G-keys
-  > Device coverage is limited by the hardware I have on hand. Adding a new device requires decoding its raw HID reports and writing a small driver — if you'd like your device supported, open a request and I'll do my best to add it.
+- **Extra mouse buttons** — full support for MMO mice and gaming keyboards with G-keys (see [Supported Devices](SUPPORTED_DEVICES.md))
 - **Low latency** — written in Rust, reads directly from evdev, no X11 or Wayland dependency
 - **Portable** — ships as a single AppImage; no installation required beyond a one-time permission setup
 
@@ -20,14 +19,7 @@ A Linux gaming input remapper with per-game profiles, precise macro timing, and 
 
 ## Supported Devices
 
-| Device | Extra Buttons |
-|--------|---------------|
-| Corsair K95 RGB | G1–G18 |
-| UTechSmart Venus MMO Mouse | M1–M12 side buttons |
-
-Standard keyboards and mice work out of the box — the above devices get full support for their extra buttons.
-
-This list reflects the hardware I personally have access to. If you'd like support added for your device, please [open a feature request](../../issues) — the more detail you can provide about the raw HID reports your device sends, the easier it is to add support.
+See [SUPPORTED_DEVICES.md](SUPPORTED_DEVICES.md) for the full list of tested hardware and notes on requesting support for new devices.
 
 ---
 
