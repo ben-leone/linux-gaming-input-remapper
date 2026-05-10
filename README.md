@@ -70,6 +70,14 @@ gameremap <subcommand>
 
 ---
 
+## How It Works
+
+GameRemapper reads raw input directly from `/dev/input/event*` using the Linux evdev interface. When a profile is active it grabs the relevant devices (so raw events don't reach games), applies your macros and remaps, and re-injects the result through a virtual uinput device that games see normally. Everything runs inside the profile editor process — closing the window stops all remapping cleanly.
+
+Extra buttons on supported gaming mice and keyboards are handled separately via the hidraw interface and injected as standard Linux macro key events (`KEY_MACRO1` and up), which you can then assign in the profile editor like any other key.
+
+---
+
 ## One-Time Permission Setup
 
 GameRemapper needs read access to `/dev/input/event*` (raw input) and write access to `/dev/uinput` and `/dev/hidraw*` (virtual device injection). On first launch the app checks whether it can open these nodes. If it cannot, it prompts you to run a one-time setup via a polkit (pkexec) dialog — no terminal required.
@@ -135,14 +143,6 @@ sudo udevadm control --reload
 sudo udevadm trigger --subsystem-match=input
 sudo gpasswd -d $USER input   # optional: remove from input group
 ```
-
----
-
-## How It Works
-
-GameRemapper reads raw input directly from `/dev/input/event*` using the Linux evdev interface. When a profile is active it grabs the relevant devices (so raw events don't reach games), applies your macros and remaps, and re-injects the result through a virtual uinput device that games see normally. Everything runs inside the profile editor process — closing the window stops all remapping cleanly.
-
-Extra buttons on supported gaming mice and keyboards are handled separately via the hidraw interface and injected as standard Linux macro key events (`KEY_MACRO1` and up), which you can then assign in the profile editor like any other key.
 
 ---
 
