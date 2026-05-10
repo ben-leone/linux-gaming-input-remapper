@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=GameRemap
+Comment=Linux gaming input remapper
+Exec=gameremap
+Icon=gameremap
+Categories=Utility;Game;
+Terminal=false
+StartupNotify=true
+Keywords=keyboard;mouse;remap;macro;gaming;

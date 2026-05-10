@@ -1,0 +1,4 @@
+#!/bin/bash
+APPDIR="$(cd "$(dirname "$0")" && pwd)"
+export PATH="${APPDIR}/usr/bin:${PATH}"
+exec "${APPDIR}/usr/bin/gameremap" "$@"

@@ -1,0 +1,27 @@
+# Known gaming device database
+# Fields: vendor (hex), product (hex), name, type, extra_keys (optional notes)
+# Used for friendly display names; falls back to kernel-reported name if not found here.
+
+[[device]]
+vendor  = 0x1532
+product = 0x0232
+name    = "Razer BlackWidow V3"
+type    = ["keyboard"]
+
+[[device]]
+vendor  = 0x1b1c
+product = 0x1b49
+name    = "Corsair K95 RGB Platinum"
+type    = ["keyboard"]
+
+[[device]]
+vendor  = 0x046d
+product = 0xc33f
+name    = "Logitech G815"
+type    = ["keyboard"]
+
+[[device]]
+vendor  = 0x1038
+product = 0x1610
+name    = "SteelSeries Apex Pro"
+type    = ["keyboard"]

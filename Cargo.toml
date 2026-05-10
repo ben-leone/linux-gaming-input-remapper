@@ -1,0 +1,22 @@
+[package]
+name = "gameremap"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+
+[[bin]]
+name = "gameremap"
+path = "src/main.rs"
+
+[dependencies]
+evdev        = "0.12"
+eframe       = "0.28"
+egui         = "0.28"
+egui_extras  = "0.28"
+clap         = { version = "4", features = ["derive"] }
+serde        = { version = "1", features = ["derive"] }
+toml         = "0.8"
+uuid         = { version = "1", features = ["v4", "serde"] }
+dirs         = "5"
+tokio        = { version = "1", features = ["rt-multi-thread", "io-util", "net", "sync", "time", "macros"] }
+libc         = "0.2"

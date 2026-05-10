@@ -1,0 +1,25 @@
+FROM rust:latest
+
+# Build deps for eframe (winit needs X11/Wayland headers even for a headless compile)
+RUN apt-get update && apt-get install -y \
+    # X11
+    libx11-dev \
+    libxrandr-dev \
+    libxcursor-dev \
+    libxi-dev \
+    libxcb1-dev \
+    libxcb-render0-dev \
+    libxcb-shape0-dev \
+    libxcb-xfixes0-dev \
+    # XKB (keyboard input)
+    libxkbcommon-dev \
+    libxkbcommon-x11-dev \
+    # Wayland
+    libwayland-dev \
+    # OpenGL for eframe glow backend
+    libgl1-mesa-dev \
+    # General
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src

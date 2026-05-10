@@ -1,0 +1,9 @@
+# gameremap udev rules
+# Grant 'input' group read access to all event nodes and write access to uinput.
+# Install: sudo cp 99-gameremap.rules /etc/udev/rules.d/
+#          sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=input
+# Then add your user: sudo usermod -aG input $USER  (log out and back in)
+
+KERNEL=="event*", SUBSYSTEM=="input", GROUP="input", MODE="0660"
+KERNEL=="uinput",                     GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"
+KERNEL=="hidraw*",                    GROUP="input", MODE="0660"
