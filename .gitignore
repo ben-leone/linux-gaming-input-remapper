@@ -15,6 +15,9 @@
 # Claude Code
 .claude
 
+# Scratch / throwaway experiments
+/scratch
+
 # OS
 .DS_Store
 Thumbs.db

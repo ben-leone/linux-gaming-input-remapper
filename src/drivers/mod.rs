@@ -6,6 +6,7 @@ use crate::event_types::DisplayEvent;
 use crate::hidraw::HidRawDevice;
 
 pub mod corsair;
+pub mod logitech;
 pub mod utechsmart;
 
 pub trait SupplementalDriver: Send {
@@ -25,6 +26,7 @@ pub fn start_supplemental_drivers(
 ) {
     let drivers: Vec<Box<dyn SupplementalDriver>> = corsair::registered_drivers()
         .into_iter()
+        .chain(logitech::registered_drivers())
         .chain(utechsmart::registered_drivers())
         .collect();
 

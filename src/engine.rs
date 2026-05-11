@@ -1,7 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use evdev::{EventType, InputEvent, Key, RelativeAxisType};
@@ -9,8 +9,61 @@ use evdev::uinput::VirtualDeviceBuilder;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::config::{AdvancedEvent, FireMode, Macro, Profile, StepMode};
+use crate::config::{AdvancedEvent, FireMode, Macro, Profile, StepMode, TriggerMode};
 use crate::config::store;
+use crate::constants;
+
+// ── Diagnostic log ────────────────────────────────────────────────────────────
+
+static LOG_ENABLED: AtomicBool = AtomicBool::new(false);
+static LOG_BUF: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
+
+fn log_buf() -> &'static Mutex<VecDeque<String>> {
+    LOG_BUF.get_or_init(|| Mutex::new(VecDeque::with_capacity(constants::ENGINE_LOG_CAPACITY)))
+}
+
+fn log_ms() -> u64 {
+    static T0: OnceLock<std::time::Instant> = OnceLock::new();
+    T0.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+macro_rules! engine_log {
+    ($($arg:tt)*) => {
+        if LOG_ENABLED.load(Ordering::Relaxed) {
+            let msg = format!("[{:>8}ms] {}", log_ms(), format_args!($($arg)*));
+            let mut buf = log_buf().lock().unwrap();
+            if buf.len() >= constants::ENGINE_LOG_CAPACITY { buf.pop_front(); }
+            buf.push_back(msg);
+        }
+    };
+}
+
+pub fn set_engine_logging(enabled: bool) {
+    LOG_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub fn drain_engine_log() -> Vec<String> {
+    log_buf().lock().unwrap().drain(..).collect()
+}
+
+pub fn clear_engine_log() {
+    log_buf().lock().unwrap().clear();
+}
+
+
+struct LoopContext {
+    pre_macros:   Vec<(crate::config::Macro, u32)>,         // (mac, delay_ms)
+    cycle_macros: Vec<(crate::config::Macro, u32, u32)>,    // (mac, order, delay_ms)
+    end_events:   Vec<(crate::config::Macro, u32, u32)>,    // (mac, min_loops, delay_ms)
+    cycle_count:  Arc<AtomicU64>,
+    stop:         Arc<AtomicBool>,
+}
+
+struct ActiveLoopEntry {
+    join:         tokio::task::JoinHandle<()>,
+    stop:         Arc<AtomicBool>,
+    release_keys: Vec<Key>, // used only on forced-abort (session shutdown)
+}
 
 // ── Auto-detect event ─────────────────────────────────────────────────────────
 
@@ -43,7 +96,7 @@ impl Engine {
         let (dummy_tx, _) = std::sync::mpsc::channel::<crate::event_types::DisplayEvent>();
         rt.block_on(async {
             crate::drivers::start_supplemental_drivers(dummy_tx, std::time::Instant::now());
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(constants::DRIVER_STARTUP_WAIT_MS)).await;
         });
         Engine {
             rt,
@@ -199,6 +252,23 @@ async fn start_session(uuid: Uuid) -> Result<ActiveSession, String> {
                 has_keys = true;
             }
         }
+        // Also register keys used by event macros so the vdev can emit them.
+        for ev in &mac.events {
+            if let Some(ev_mac) = profile.macros.iter().find(|m| m.id == ev.macro_id) {
+                for step in &ev_mac.simple_steps {
+                    if let Some(key) = parse_key(&step.action) {
+                        vdev_keys.insert(key);
+                        has_keys = true;
+                    }
+                }
+                for step in &ev_mac.advanced_steps {
+                    if let Some(key) = parse_key(&step.key) {
+                        vdev_keys.insert(key);
+                        has_keys = true;
+                    }
+                }
+            }
+        }
     }
     for assignment in &profile.assignments {
         if let Some(remap_name) = &assignment.remap_key {
@@ -225,7 +295,7 @@ async fn start_session(uuid: Uuid) -> Result<ActiveSession, String> {
     let vdev = Arc::new(std::sync::Mutex::new(vdev));
 
     let cancel = Arc::new(AtomicBool::new(true));
-    let (event_tx, event_rx) = mpsc::channel::<(InputEvent, String)>(512);
+    let (event_tx, event_rx) = mpsc::channel::<(InputEvent, String)>(constants::EVENT_CHANNEL_CAPACITY);
     let mut grabbed_fds: Vec<std::os::fd::OwnedFd> = Vec::new();
 
     for mut device in devices_to_grab {
@@ -265,7 +335,7 @@ async fn stop_session(session: ActiveSession) {
     // Ask the processor to release held keys and exit cleanly.
     let abort = session.processor.abort_handle();
     let _ = session.stop_tx.send(());
-    if tokio::time::timeout(std::time::Duration::from_millis(300), session.processor)
+    if tokio::time::timeout(std::time::Duration::from_millis(constants::SESSION_SHUTDOWN_TIMEOUT_MS), session.processor)
         .await
         .is_err()
     {
@@ -344,8 +414,10 @@ async fn run_event_processor(
     let mut held_mods:    HashSet<Uuid> = HashSet::new();
     // source key code → remapped Key currently held down
     let mut active_remaps: HashMap<u16, Key> = HashMap::new();
-    // source key code → (abort handle, keys to release on stop)
-    let mut active_loops: HashMap<u16, (tokio::task::AbortHandle, Vec<Key>)> = HashMap::new();
+    // source key code → loop entry (abort handle, release keys, cycle count, end events)
+    let mut active_loops: HashMap<u16, ActiveLoopEntry> = HashMap::new();
+    // source key code → (press instant, device name, mods held at press) for QuickPress/ShortHold
+    let mut pending_triggers: HashMap<u16, (std::time::Instant, String, HashSet<Uuid>)> = HashMap::new();
     // abort handle for the ESC-held-7s emergency-exit timer
     let mut esc_exit_task: Option<tokio::task::AbortHandle> = None;
 
@@ -369,8 +441,8 @@ async fn run_event_processor(
                 if key == Key::KEY_ESC {
                     if value == 1 {
                         let handle = tokio::spawn(async {
-                            tokio::time::sleep(std::time::Duration::from_secs(7)).await;
-                            eprintln!("daemon: ESC held 7 seconds — exiting");
+                            tokio::time::sleep(std::time::Duration::from_secs(constants::ESC_EXIT_HOLD_SECS)).await;
+                            eprintln!("daemon: ESC held {} seconds — exiting", constants::ESC_EXIT_HOLD_SECS);
                             std::process::exit(0);
                         });
                         esc_exit_task = Some(handle.abort_handle());
@@ -388,16 +460,32 @@ async fn run_event_processor(
                         held_mods.remove(&mod_id);
                         continue;
                     }
+                    // Deferred timed trigger: classify hold duration and fire if it matches.
+                    if let Some((press_time, press_device, press_mods)) = pending_triggers.remove(&code) {
+                        let elapsed_ms = press_time.elapsed().as_millis() as u64;
+                        if let Some(assignment) = find_timed_assignment(&profile, &name, &press_mods, &press_device, elapsed_ms) {
+                            if let Some(macro_id) = assignment.macro_id {
+                                if let Some(mac) = profile.macros.iter().find(|m| m.id == macro_id) {
+                                    if mac.fire == FireMode::Single {
+                                        let sink: Arc<dyn KeySink> = Arc::new(VdevSink(vdev.clone()));
+                                        tokio::spawn(run_macro(mac.clone(), sink, None));
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     if let Some(rkey) = active_remaps.remove(&code) {
                         emit_key(&vdev, rkey, 0);
                         continue;
                     }
-                    if let Some((abort, release_keys)) = active_loops.remove(&code) {
-                        abort.abort();
-                        // Emit up for every key the macro pressed so nothing stays held.
-                        for key in release_keys {
-                            emit_key(&vdev, key, 0);
-                        }
+                    if let Some(entry) = active_loops.remove(&code) {
+                        // Signal the loop to stop after its current iteration.
+                        // The loop task itself will then run end events serially
+                        // before exiting — no separate spawning needed here.
+                        entry.stop.store(true, Ordering::Relaxed);
+                        let join = entry.join;
+                        tokio::spawn(async move { let _ = join.await; });
                         continue;
                     }
                     // Passthrough release.
@@ -412,7 +500,7 @@ async fn run_event_processor(
                         continue;
                     }
 
-                    // Assignment lookup — most specific modifier+device match wins.
+                    // Immediate-fire assignment: remaps (any trigger_mode) or Any-mode macros.
                     if let Some(assignment) = find_assignment(&profile, &name, &held_mods, &device_name) {
                         if let Some(remap_name) = assignment.remap_key.clone() {
                             if let Some(rkey) = parse_key(&remap_name) {
@@ -424,12 +512,49 @@ async fn run_event_processor(
                                 let is_loop = mac.fire == FireMode::Loop;
                                 let release_keys = if is_loop { macro_release_keys(mac) } else { Vec::new() };
                                 let sink: Arc<dyn KeySink> = Arc::new(VdevSink(vdev.clone()));
-                                let handle = tokio::spawn(run_macro(mac.clone(), sink));
                                 if is_loop {
-                                    active_loops.insert(code, (handle.abort_handle(), release_keys));
+                                    let cycle_count = Arc::new(AtomicU64::new(0));
+                                    let stop        = Arc::new(AtomicBool::new(false));
+                                    let mut pre_macros   = Vec::new();
+                                    let mut cycle_macros = Vec::new();
+                                    let mut end_events   = Vec::new();
+                                    for ev in &mac.events {
+                                        let Some(ev_mac) = profile.macros.iter().find(|m| {
+                                            m.id == ev.macro_id
+                                                && m.fire == FireMode::Single
+                                                && m.events.is_empty()
+                                        }) else { continue };
+                                        match ev.order {
+                                            0  => pre_macros.push((ev_mac.clone(), ev.delay_ms)),
+                                            -1 => end_events.push((ev_mac.clone(), ev.min_loops, ev.delay_ms)),
+                                            n if n > 0 => cycle_macros.push((ev_mac.clone(), n as u32, ev.delay_ms)),
+                                            _ => {}
+                                        }
+                                    }
+                                    let loop_ctx = LoopContext {
+                                        pre_macros,
+                                        cycle_macros,
+                                        end_events,
+                                        cycle_count: cycle_count.clone(),
+                                        stop: stop.clone(),
+                                    };
+                                    let handle = tokio::spawn(run_macro(mac.clone(), sink.clone(), Some(loop_ctx)));
+                                    active_loops.insert(code, ActiveLoopEntry {
+                                        join: handle,
+                                        stop,
+                                        release_keys,
+                                    });
+                                } else {
+                                    tokio::spawn(run_macro(mac.clone(), sink, None));
                                 }
                             }
                         }
+                        continue;
+                    }
+
+                    // Deferred-trigger assignment (QuickPress / ShortHold): record press time.
+                    if has_deferred_trigger(&profile, &name, &held_mods, &device_name) {
+                        pending_triggers.insert(code, (std::time::Instant::now(), device_name.clone(), held_mods.clone()));
                         continue;
                     }
 
@@ -449,17 +574,21 @@ async fn run_event_processor(
     }
 
     // Graceful cleanup: abort running loop macros and release any held keys.
-    for (_, (abort, release_keys)) in active_loops.drain() {
-        abort.abort();
-        for key in release_keys {
+    for (_, entry) in active_loops.drain() {
+        entry.join.abort();
+        for key in entry.release_keys {
             emit_key(&vdev, key, 0);
         }
+        // Do NOT fire end events on graceful stop (session end, not key release).
     }
     for (_, rkey) in active_remaps.drain() {
         emit_key(&vdev, rkey, 0);
     }
 }
 
+/// Returns the best immediately-fireable assignment on key press: any remap, or
+/// a macro assignment with TriggerMode::Any.  QuickPress/ShortHold macros are
+/// excluded here — they are deferred to key release via `pending_triggers`.
 fn find_assignment<'a>(
     profile: &'a Profile,
     key_name: &str,
@@ -470,10 +599,52 @@ fn find_assignment<'a>(
         .filter(|a| {
             a.source_key == key_name
                 && a.modifiers.iter().all(|m| held_mods.contains(m))
-                // None = any device; Some(name) = only that device
+                && a.source_device.as_deref().map_or(true, |d| d == device_name)
+                // Remaps always fire immediately; macros only fire immediately on Any.
+                && (a.remap_key.is_some() || a.trigger_mode == TriggerMode::Any)
+        })
+        .max_by_key(|a| (a.modifiers.len(), a.source_device.is_some() as usize))
+}
+
+/// Returns true if any QuickPress/ShortHold macro assignment matches this key press.
+fn has_deferred_trigger(
+    profile: &Profile,
+    key_name: &str,
+    held_mods: &HashSet<Uuid>,
+    device_name: &str,
+) -> bool {
+    profile.assignments.iter().any(|a| {
+        a.source_key == key_name
+            && a.macro_id.is_some()
+            && matches!(a.trigger_mode, TriggerMode::QuickPress | TriggerMode::ShortHold)
+            && a.modifiers.iter().all(|m| held_mods.contains(m))
+            && a.source_device.as_deref().map_or(true, |d| d == device_name)
+    })
+}
+
+/// Finds the deferred macro assignment whose TriggerMode matches the hold duration.
+fn find_timed_assignment<'a>(
+    profile: &'a Profile,
+    key_name: &str,
+    held_mods: &HashSet<Uuid>,
+    device_name: &str,
+    elapsed_ms: u64,
+) -> Option<&'a crate::config::KeyAssignment> {
+    let trigger = if elapsed_ms < constants::QUICK_PRESS_MAX_MS {
+        TriggerMode::QuickPress
+    } else if elapsed_ms < constants::SHORT_HOLD_MAX_MS {
+        TriggerMode::ShortHold
+    } else {
+        return None; // held too long — no match
+    };
+    profile.assignments.iter()
+        .filter(|a| {
+            a.source_key == key_name
+                && a.macro_id.is_some()
+                && a.trigger_mode == trigger
+                && a.modifiers.iter().all(|m| held_mods.contains(m))
                 && a.source_device.as_deref().map_or(true, |d| d == device_name)
         })
-        // device-specific assignments win over device-any when modifier count ties
         .max_by_key(|a| (a.modifiers.len(), a.source_device.is_some() as usize))
 }
 
@@ -524,59 +695,198 @@ impl KeySink for RecordingSink {
 
 /// Executes a macro against the given sink.
 /// For Loop macros, runs indefinitely until the task is aborted (key release).
-async fn run_macro(mac: Macro, sink: Arc<dyn KeySink>) {
+fn run_macro(mac: Macro, sink: Arc<dyn KeySink>, loop_ctx: Option<LoopContext>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(async move {
     let is_loop = mac.fire == FireMode::Loop;
+
+    if is_loop {
+        if let Some(ref ctx) = loop_ctx {
+            engine_log!("[{}] loop START  end={} pre={} cycle={}",
+                mac.name,
+                ctx.end_events.len(),
+                ctx.pre_macros.len(),
+                ctx.cycle_macros.len(),
+            );
+        }
+    }
 
     if mac.start_delay_ms > 0 {
         tokio::time::sleep(std::time::Duration::from_millis(mac.start_delay_ms as u64)).await;
     }
 
     match mac.mode {
-        StepMode::Simple => loop {
-            for step in &mac.simple_steps {
-                if let Some(key) = parse_key(&step.action) {
-                    sink.emit_key(key, 1);
-                    if step.hold_ms > 0 {
+        StepMode::Simple => {
+            'simple: loop {
+                // Pre events — serial before each iteration body.
+                if let Some(ref ctx) = loop_ctx {
+                    for (pre, delay_ms) in &ctx.pre_macros {
+                        if *delay_ms > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(*delay_ms as u64)).await;
+                        }
+                        run_macro(pre.clone(), sink.clone(), None).await;
+                    }
+                }
+                for step in &mac.simple_steps {
+                    if let Some(key) = parse_key(&step.action) {
+                        if !is_loop { engine_log!("[{}] step {} ↓", mac.name, step.action); }
+                        sink.emit_key(key, 1);
+                        if step.hold_ms > 0 {
+                            tokio::time::sleep(
+                                std::time::Duration::from_millis(step.hold_ms as u64)
+                            ).await;
+                        }
+                        sink.emit_key(key, 0);
+                        if !is_loop { engine_log!("[{}] step {} ↑", mac.name, step.action); }
+                    }
+                    if step.delay_after_ms > 0 {
                         tokio::time::sleep(
-                            std::time::Duration::from_millis(step.hold_ms as u64)
+                            std::time::Duration::from_millis(step.delay_after_ms as u64)
                         ).await;
                     }
-                    sink.emit_key(key, 0);
                 }
-                if step.delay_after_ms > 0 {
+                if !is_loop { break 'simple; }
+                // Cycle events — serial after each complete iteration.
+                if let Some(ref ctx) = loop_ctx {
+                    let c = ctx.cycle_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    engine_log!("[{}] cycle {}", mac.name, c);
+                    for (cyc_mac, order, delay_ms) in &ctx.cycle_macros {
+                        if c % *order as u64 == 0 {
+                            if *delay_ms > 0 {
+                                tokio::time::sleep(std::time::Duration::from_millis(*delay_ms as u64)).await;
+                            }
+                            run_macro(cyc_mac.clone(), sink.clone(), None).await;
+                        }
+                    }
+                    if ctx.stop.load(Ordering::Relaxed) {
+                        engine_log!("[{}] stop at cycle {} (post-body)", mac.name, c);
+                        if mac.loop_delay_ms > 0 {
+                            tokio::time::sleep(
+                                std::time::Duration::from_millis(mac.loop_delay_ms as u64)
+                            ).await;
+                        }
+                        break 'simple;
+                    }
+                }
+                if mac.loop_delay_ms > 0 {
                     tokio::time::sleep(
-                        std::time::Duration::from_millis(step.delay_after_ms as u64)
+                        std::time::Duration::from_millis(mac.loop_delay_ms as u64)
                     ).await;
                 }
+                if let Some(ref ctx) = loop_ctx {
+                    if ctx.stop.load(Ordering::Relaxed) {
+                        engine_log!("[{}] stop at cycle {} (post-delay)",
+                            mac.name, ctx.cycle_count.load(Ordering::Relaxed));
+                        break 'simple;
+                    }
+                }
             }
-            if !is_loop { break; }
-            if mac.loop_delay_ms > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(mac.loop_delay_ms as u64)).await;
+            // End events — serial in this same task after the loop exits.
+            if is_loop {
+                if let Some(ref ctx) = loop_ctx {
+                    let cycles = ctx.cycle_count.load(Ordering::Relaxed);
+                    engine_log!("[{}] end-events: cycles={} candidates={}", mac.name, cycles, ctx.end_events.len());
+                    for (end_mac, min_loops, delay_ms) in &ctx.end_events {
+                        if cycles >= *min_loops as u64 {
+                            engine_log!("[{}] → FIRE '{}' (cycles={} >= min_loops={}, delay={}ms)",
+                                mac.name, end_mac.name, cycles, min_loops, delay_ms);
+                            if *delay_ms > 0 {
+                                tokio::time::sleep(std::time::Duration::from_millis(*delay_ms as u64)).await;
+                            }
+                            run_macro(end_mac.clone(), sink.clone(), None).await;
+                        } else {
+                            engine_log!("[{}] → SKIP '{}' (cycles={} < min_loops={})",
+                                mac.name, end_mac.name, cycles, min_loops);
+                        }
+                    }
+                }
             }
-        },
+        }
 
-        StepMode::Advanced => loop {
-            let t0 = tokio::time::Instant::now();
-            for step in &mac.advanced_steps {
-                let target = std::time::Duration::from_millis(step.time_ms as u64);
-                let elapsed = t0.elapsed();
-                if target > elapsed {
-                    tokio::time::sleep(target - elapsed).await;
+        StepMode::Advanced => {
+            'advanced: loop {
+                // Pre events — serial before each iteration body.
+                if let Some(ref ctx) = loop_ctx {
+                    for (pre, delay_ms) in &ctx.pre_macros {
+                        if *delay_ms > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(*delay_ms as u64)).await;
+                        }
+                        run_macro(pre.clone(), sink.clone(), None).await;
+                    }
                 }
-                if let Some(key) = parse_key(&step.key) {
-                    let value = match step.event {
-                        AdvancedEvent::KeyDown | AdvancedEvent::MouseDown => 1,
-                        AdvancedEvent::KeyUp   | AdvancedEvent::MouseUp   => 0,
-                    };
-                    sink.emit_key(key, value);
+                let t0 = tokio::time::Instant::now();
+                for step in &mac.advanced_steps {
+                    let target  = std::time::Duration::from_millis(step.time_ms as u64);
+                    let elapsed = t0.elapsed();
+                    if target > elapsed {
+                        tokio::time::sleep(target - elapsed).await;
+                    }
+                    if let Some(key) = parse_key(&step.key) {
+                        let value = match step.event {
+                            AdvancedEvent::KeyDown | AdvancedEvent::MouseDown => 1,
+                            AdvancedEvent::KeyUp   | AdvancedEvent::MouseUp   => 0,
+                        };
+                        sink.emit_key(key, value);
+                    }
+                }
+                if !is_loop { break 'advanced; }
+                // Cycle events — serial after each complete iteration.
+                if let Some(ref ctx) = loop_ctx {
+                    let c = ctx.cycle_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    engine_log!("[{}] cycle {}", mac.name, c);
+                    for (cyc_mac, order, delay_ms) in &ctx.cycle_macros {
+                        if c % *order as u64 == 0 {
+                            if *delay_ms > 0 {
+                                tokio::time::sleep(std::time::Duration::from_millis(*delay_ms as u64)).await;
+                            }
+                            run_macro(cyc_mac.clone(), sink.clone(), None).await;
+                        }
+                    }
+                    if ctx.stop.load(Ordering::Relaxed) {
+                        engine_log!("[{}] stop at cycle {} (post-body)", mac.name, c);
+                        if mac.loop_delay_ms > 0 {
+                            tokio::time::sleep(
+                                std::time::Duration::from_millis(mac.loop_delay_ms as u64)
+                            ).await;
+                        }
+                        break 'advanced;
+                    }
+                }
+                if mac.loop_delay_ms > 0 {
+                    tokio::time::sleep(
+                        std::time::Duration::from_millis(mac.loop_delay_ms as u64)
+                    ).await;
+                }
+                if let Some(ref ctx) = loop_ctx {
+                    if ctx.stop.load(Ordering::Relaxed) {
+                        engine_log!("[{}] stop at cycle {} (post-delay)",
+                            mac.name, ctx.cycle_count.load(Ordering::Relaxed));
+                        break 'advanced;
+                    }
                 }
             }
-            if !is_loop { break; }
-            if mac.loop_delay_ms > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(mac.loop_delay_ms as u64)).await;
+            // End events — serial in this same task after the loop exits.
+            if is_loop {
+                if let Some(ref ctx) = loop_ctx {
+                    let cycles = ctx.cycle_count.load(Ordering::Relaxed);
+                    engine_log!("[{}] end-events: cycles={} candidates={}", mac.name, cycles, ctx.end_events.len());
+                    for (end_mac, min_loops, delay_ms) in &ctx.end_events {
+                        if cycles >= *min_loops as u64 {
+                            engine_log!("[{}] → FIRE '{}' (cycles={} >= min_loops={}, delay={}ms)",
+                                mac.name, end_mac.name, cycles, min_loops, delay_ms);
+                            if *delay_ms > 0 {
+                                tokio::time::sleep(std::time::Duration::from_millis(*delay_ms as u64)).await;
+                            }
+                            run_macro(end_mac.clone(), sink.clone(), None).await;
+                        } else {
+                            engine_log!("[{}] → SKIP '{}' (cycles={} < min_loops={})",
+                                mac.name, end_mac.name, cycles, min_loops);
+                        }
+                    }
+                }
             }
-        },
+        }
     }
+    })
 }
 
 // ── uinput helpers ────────────────────────────────────────────────────────────
@@ -592,8 +902,6 @@ fn emit_key(vdev: &Arc<std::sync::Mutex<evdev::uinput::VirtualDevice>>, key: Key
 /// Handles KEY_MACRO1–KEY_MACRO30 (0x290–0x2AD) explicitly because older evdev
 /// crate versions report those as "unknown key: N" rather than their canonical name.
 fn parse_key(name: &str) -> Option<Key> {
-    use std::collections::HashMap;
-    use std::sync::OnceLock;
     static MAP: OnceLock<HashMap<String, Key>> = OnceLock::new();
     let map = MAP.get_or_init(|| {
         let mut m = HashMap::new();
@@ -604,7 +912,7 @@ fn parse_key(name: &str) -> Option<Key> {
         // KEY_MACRO1–KEY_MACRO30 may be reported as "unknown key: N" by older
         // evdev crate versions, so insert them explicitly under their canonical names.
         for idx in 1u16..=30 {
-            m.insert(format!("KEY_MACRO{idx}"), Key::new(0x290 + idx - 1));
+            m.insert(format!("KEY_MACRO{idx}"), Key::new(constants::KEY_MACRO_BASE + idx - 1));
         }
         m
     });
@@ -618,8 +926,8 @@ pub(crate) fn key_name(key: Key) -> String {
     let s = format!("{key:?}");
     if s.starts_with("unknown key:") {
         let code = key.code();
-        if (0x290..=0x2AD).contains(&code) {
-            return format!("KEY_MACRO{}", code - 0x290 + 1);
+        if (constants::KEY_MACRO_BASE..=constants::KEY_MACRO_MAX).contains(&code) {
+            return format!("KEY_MACRO{}", code - constants::KEY_MACRO_BASE + 1);
         }
     }
     s
@@ -653,11 +961,11 @@ fn scanner_thread(profiles: Vec<Profile>, tx: std::sync::mpsc::SyncSender<Detect
                     .unwrap_or(false);
 
                 if alive {
-                    sleep_cancellable(30_000, &cancel);
+                    sleep_cancellable(constants::AUTODETECT_MONITOR_INTERVAL_MS, &cancel);
                 } else {
                     monitoring = None;
                     let _ = tx.try_send(DetectEvent::Lost);
-                    sleep_cancellable(2_000, &cancel); // brief pause before re-searching
+                    sleep_cancellable(constants::AUTODETECT_LOST_PAUSE_MS, &cancel);
                 }
             }
             None => {
@@ -667,7 +975,7 @@ fn scanner_thread(profiles: Vec<Profile>, tx: std::sync::mpsc::SyncSender<Detect
                     let _ = tx.try_send(DetectEvent::Found(p.id));
                     // No sleep — enter monitoring mode immediately on the next iteration.
                 } else {
-                    sleep_cancellable(10_000, &cancel);
+                    sleep_cancellable(constants::AUTODETECT_SEARCH_INTERVAL_MS, &cancel);
                 }
             }
         }
@@ -689,7 +997,7 @@ fn profile_matches(profile: &Profile, proc_strings: &[String]) -> bool {
 fn sleep_cancellable(total_ms: u64, cancel: &Arc<AtomicBool>) {
     for _ in 0..(total_ms / 100) {
         if !cancel.load(Ordering::Relaxed) { return; }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::thread::sleep(std::time::Duration::from_millis(constants::AUTODETECT_SLEEP_GRANULE_MS));
     }
 }
 
@@ -734,6 +1042,7 @@ mod tests {
             loop_delay_ms: 0,
             simple_steps: vec![],
             advanced_steps: steps,
+            events: vec![],
         }
     }
 
@@ -742,7 +1051,7 @@ mod tests {
     ///   cargo test macro_ -- --nocapture
     async fn run_for(mac: Macro, window_ms: u64) -> Vec<(u64, Key, i32)> {
         let sink = Arc::new(RecordingSink::new());
-        let task = tokio::spawn(run_macro(mac, sink.clone()));
+        let task = tokio::spawn(run_macro(mac, sink.clone(), None));
         tokio::time::sleep(std::time::Duration::from_millis(window_ms)).await;
         task.abort();
         let _ = task.await;
@@ -808,6 +1117,7 @@ mod tests {
             loop_delay_ms: 0,
             simple_steps: steps,
             advanced_steps: vec![],
+            events: vec![],
         }
     }
 

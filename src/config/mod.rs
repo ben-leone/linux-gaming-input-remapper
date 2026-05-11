@@ -102,6 +102,21 @@ impl ModifierKey {
 // ── Macros ────────────────────────────────────────────────────────────────────
 
 fn is_zero_u32(v: &u32) -> bool { *v == 0 }
+fn default_event_delay_ms() -> u32 { crate::constants::DEFAULT_EVENT_DELAY_MS }
+fn is_default_event_delay(v: &u32) -> bool { *v == crate::constants::DEFAULT_EVENT_DELAY_MS }
+
+/// Controls when a Single-macro assignment fires relative to the key hold duration.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerMode {
+    /// Fires immediately on key press (default behaviour).
+    #[default]
+    Any,
+    /// Fires on key release if held less than 50 ms.
+    QuickPress,
+    /// Fires on key release if held 50–200 ms.
+    ShortHold,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -137,6 +152,10 @@ pub struct Macro {
     pub simple_steps: Vec<SimpleStep>,
     #[serde(default)]
     pub advanced_steps: Vec<AdvancedStep>,
+    /// Events that fire at specific lifecycle points during loop execution.
+    /// Only meaningful when fire == FireMode::Loop.
+    #[serde(default)]
+    pub events: Vec<LoopEvent>,
 }
 
 impl Macro {
@@ -150,6 +169,7 @@ impl Macro {
             loop_delay_ms: 0,
             simple_steps: Vec::new(),
             advanced_steps: Vec::new(),
+            events: Vec::new(),
         }
     }
 }
@@ -185,6 +205,27 @@ pub struct AdvancedStep {
     pub time_ms: u32,
 }
 
+/// One event attached to a loop macro. Events fire at specific points
+/// in the loop lifecycle and call a referenced Single-fire macro.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoopEvent {
+    pub id: Uuid,
+    /// UUID of a Single-fire macro to invoke when this event fires.
+    pub macro_id: Uuid,
+    /// Scheduling order:
+    ///   0  = fires before every loop iteration (pre-action)
+    ///  -1  = fires when key is released / loop ends (end action)
+    ///   N  = fires at the end of every Nth complete cycle (N > 0)
+    pub order: i32,
+    /// For end events (order == -1): minimum complete cycles that must
+    /// have run before this end event fires. Ignored for other orders.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub min_loops: u32,
+    /// Milliseconds to wait before invoking the event macro.
+    #[serde(default = "default_event_delay_ms", skip_serializing_if = "is_default_event_delay")]
+    pub delay_ms: u32,
+}
+
 // ── Key assignments ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,6 +244,10 @@ pub struct KeyAssignment {
     pub remap_key: Option<String>,
     /// If set, trigger this macro (mutually exclusive with remap_key).
     pub macro_id: Option<Uuid>,
+    /// For Single-macro assignments: when to fire relative to hold duration.
+    /// Ignored for remap assignments.
+    #[serde(default)]
+    pub trigger_mode: TriggerMode,
 }
 
 impl KeyAssignment {
@@ -214,6 +259,7 @@ impl KeyAssignment {
             modifiers: Vec::new(),
             remap_key: None,
             macro_id: None,
+            trigger_mode: TriggerMode::Any,
         }
     }
 }

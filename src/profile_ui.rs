@@ -5,8 +5,8 @@ use std::sync::mpsc;
 use uuid::Uuid;
 
 use crate::config::{
-    store, AppSettings, AutoDetectTarget, FireMode, GameLink, KeyAssignment, Macro, ModifierKey,
-    Profile, SimpleStep, StepMode,
+    store, AppSettings, AutoDetectTarget, FireMode, GameLink, KeyAssignment, LoopEvent, Macro,
+    ModifierKey, Profile, SimpleStep, StepMode, TriggerMode,
 };
 use crate::engine::DetectEvent;
 use crate::devices::DeviceReader;
@@ -49,6 +49,7 @@ enum Section {
     Assignments,
     Blocked,
     AutoDetect,
+    Log,
 }
 
 // ── App state ─────────────────────────────────────────────────────────────────
@@ -112,6 +113,10 @@ pub struct ProfileApp {
     // Scanner lifecycle
     scanner_dirty:      bool,
     auto_detected_uuid: Option<Uuid>,
+
+    // Engine log
+    log_enabled: bool,
+    log_entries: Vec<String>,
 }
 
 impl ProfileApp {
@@ -153,6 +158,8 @@ impl ProfileApp {
             new_fragment_text:  String::new(),
             scanner_dirty:      auto_switch_on,
             auto_detected_uuid: None,
+            log_enabled: false,
+            log_entries: Vec::new(),
         }
     }
 
@@ -252,14 +259,24 @@ impl ProfileApp {
                 self.new_mod_key = key;
             }
             LearnTarget::NewMacroStep => {
-                self.new_step_action = key;
+                if let (Some(profile_idx), Some(macro_idx)) = (self.selected, self.selected_macro) {
+                    let hold:  u32 = self.new_step_hold.trim().parse().unwrap_or(40);
+                    let delay: u32 = self.new_step_delay.trim().parse().unwrap_or(60);
+                    let step = crate::config::SimpleStep { action: key, hold_ms: hold, delay_after_ms: delay };
+                    self.profiles[profile_idx].macros[macro_idx].simple_steps.push(step);
+                    self.adding_step = false;
+                    self.new_step_action.clear();
+                    self.new_step_hold  = "40".into();
+                    self.new_step_delay = "60".into();
+                    self.save_current();
+                }
             }
             LearnTarget::AssignmentSource(idx) => {
-                let mods = self.profile()
+                let (mods, trigger_mode) = self.profile()
                     .and_then(|p| p.assignments.get(idx))
-                    .map(|a| a.modifiers.clone())
+                    .map(|a| (a.modifiers.clone(), a.trigger_mode.clone()))
                     .unwrap_or_default();
-                if let Some(msg) = self.assignment_guard(&key, &mods, Some(&device), idx) {
+                if let Some(msg) = self.assignment_guard(&key, &mods, Some(&device), &trigger_mode, idx) {
                     self.warn_popup = Some(msg);
                 } else {
                     if let Some(a) = self.profile_mut().and_then(|p| p.assignments.get_mut(idx)) {
@@ -293,9 +310,9 @@ impl ProfileApp {
         self.profile().map_or(false, |p| p.blocked_keys.iter().any(|k| k == key))
     }
 
-    /// Returns true if `source_key` + `modifiers` + `source_device` already exists
-    /// in the current profile, skipping `skip_idx` (pass `usize::MAX` when adding).
-    fn is_duplicate_assignment(&self, source_key: &str, modifiers: &[Uuid], source_device: Option<&str>, skip_idx: usize) -> bool {
+    /// Returns true if `source_key` + `modifiers` + `source_device` + `trigger_mode` already
+    /// exists in the current profile, skipping `skip_idx` (pass `usize::MAX` when adding).
+    fn is_duplicate_assignment(&self, source_key: &str, modifiers: &[Uuid], source_device: Option<&str>, trigger_mode: &TriggerMode, skip_idx: usize) -> bool {
         let Some(p) = self.profile() else { return false };
         let mut sorted_mods = modifiers.to_vec();
         sorted_mods.sort();
@@ -308,17 +325,18 @@ impl ProfileApp {
                     a_mods == sorted_mods
                 }
                 && a.source_device.as_deref() == source_device
+                && &a.trigger_mode == trigger_mode
         })
     }
 
     /// Check blocked and duplicate guards for a candidate source key.
     /// Returns Some(message) if the key should be rejected, None if it's fine.
-    fn assignment_guard(&self, key: &str, modifiers: &[Uuid], source_device: Option<&str>, skip_idx: usize) -> Option<String> {
+    fn assignment_guard(&self, key: &str, modifiers: &[Uuid], source_device: Option<&str>, trigger_mode: &TriggerMode, skip_idx: usize) -> Option<String> {
         if self.is_blocked(key) {
             return Some(format!("{key} is in the blocked list and cannot be assigned."));
         }
-        if self.is_duplicate_assignment(key, modifiers, source_device, skip_idx) {
-            return Some(format!("{key} is already assigned with the same modifiers."));
+        if self.is_duplicate_assignment(key, modifiers, source_device, trigger_mode, skip_idx) {
+            return Some(format!("{key} is already assigned with the same modifiers and trigger mode."));
         }
         None
     }
@@ -599,6 +617,10 @@ impl ProfileApp {
                 self.section = sec;
             }
         }
+        ui.separator();
+        if ui.selectable_label(self.section == Section::Log, "Engine Log").clicked() {
+            self.section = Section::Log;
+        }
     }
 
     // ── Modifiers section ─────────────────────────────────────────────────────
@@ -607,7 +629,6 @@ impl ProfileApp {
         ui.heading("Modifier Keys");
         ui.label(
             RichText::new("Holding a modifier changes which assignments fire.")
-                .small()
                 .color(GRAY),
         );
         ui.separator();
@@ -1040,6 +1061,13 @@ impl ProfileApp {
                     }
                 }
 
+                // ── Events section (loop macros only) ──────────────────────────
+                let current_fire = self.profiles[profile_idx].macros[macro_idx].fire.clone();
+                if current_fire == FireMode::Loop && !is_recording {
+                    ui.separator();
+                    self.show_loop_events(ui, profile_idx, macro_idx, &mut changed);
+                }
+
                 if changed {
                     store::save_profile(&self.profiles[profile_idx]);
                 }
@@ -1082,7 +1110,7 @@ impl ProfileApp {
         }
     }
 
-    fn show_add_step(&mut self, ui: &mut egui::Ui, profile_idx: usize, macro_idx: usize, changed: &mut bool) {
+    fn show_add_step(&mut self, ui: &mut egui::Ui, _profile_idx: usize, _macro_idx: usize, _changed: &mut bool) {
         let is_learning = matches!(self.learn_target, Some(LearnTarget::NewMacroStep));
 
         if !self.adding_step {
@@ -1093,6 +1121,15 @@ impl ProfileApp {
             return;
         }
 
+        // Timing fields first so user can set them before learning the key.
+        ui.horizontal(|ui| {
+            ui.label("Hold (ms):");
+            ui.add(egui::TextEdit::singleline(&mut self.new_step_hold).desired_width(50.0));
+            ui.label("Delay after (ms):");
+            ui.add(egui::TextEdit::singleline(&mut self.new_step_delay).desired_width(50.0));
+        });
+
+        // Learn key — pressing a key immediately adds the step.
         ui.horizontal(|ui| {
             if is_learning {
                 ui.spinner();
@@ -1101,47 +1138,163 @@ impl ProfileApp {
                     self.cancel_learn();
                 }
             } else {
-                if ui.button("Learn Key/Button").clicked() {
+                if ui.button("Learn Key/Button").on_hover_text("Press a key; the step is added immediately.").clicked() {
                     self.start_learn(LearnTarget::NewMacroStep);
                 }
-                if !self.new_step_action.is_empty() {
-                    ui.strong(&self.new_step_action.clone());
+                if ui.small_button("x Cancel").clicked() {
+                    self.adding_step = false;
+                    self.cancel_learn();
                 }
             }
         });
+    }
 
-        if !self.new_step_action.is_empty() {
+    fn show_loop_events(&mut self, ui: &mut egui::Ui, profile_idx: usize, macro_idx: usize, changed: &mut bool) {
+        ui.strong("Events");
+        ui.label(
+            RichText::new(
+                "Events call a Single macro at specific loop lifecycle points.\n\
+                 Order: 0 = before every iteration  |  -1 = on key release  |  N = every N cycles"
+            )
+            .color(GRAY),
+        );
+
+        // Snapshot the event list and the list of valid target macros (Single, no events, not self).
+        let current_macro_id = self.profiles[profile_idx].macros[macro_idx].id;
+        let valid_targets: Vec<(uuid::Uuid, String)> = self.profiles[profile_idx].macros
+            .iter()
+            .filter(|m| {
+                m.id != current_macro_id
+                    && m.fire == FireMode::Single
+                    && m.events.is_empty()
+            })
+            .map(|m| (m.id, m.name.clone()))
+            .collect();
+
+        let event_count = self.profiles[profile_idx].macros[macro_idx].events.len();
+
+        let mut delete_ev: Option<usize> = None;
+        let mut set_ev_macro:     Option<(usize, uuid::Uuid)> = None;
+        let mut set_ev_order:     Option<(usize, i32)> = None;
+        let mut set_ev_min_loops: Option<(usize, u32)> = None;
+        let mut set_ev_delay:     Option<(usize, u32)> = None;
+
+        for i in 0..event_count {
+            let ev = &self.profiles[profile_idx].macros[macro_idx].events[i];
+            let ev_id = ev.id;
+            let ev_macro_id  = ev.macro_id;
+            let ev_order     = ev.order;
+            let ev_min_loops = ev.min_loops;
+            let ev_delay_ms  = ev.delay_ms;
+
             ui.horizontal(|ui| {
-                ui.label("Hold (ms):");
-                ui.add(egui::TextEdit::singleline(&mut self.new_step_hold).desired_width(50.0));
-                ui.label("Delay after (ms):");
-                ui.add(egui::TextEdit::singleline(&mut self.new_step_delay).desired_width(50.0));
-
-                let hold:  u32 = self.new_step_hold.trim().parse().unwrap_or(40);
-                let delay: u32 = self.new_step_delay.trim().parse().unwrap_or(60);
-                let mut add = false;
-                ui.add_enabled_ui(true, |ui| {
-                    if ui.button("Add Step").clicked() { add = true; }
-                });
-                if add {
-                    let step = SimpleStep {
-                        action: self.new_step_action.clone(),
-                        hold_ms: hold,
-                        delay_after_ms: delay,
-                    };
-                    self.profiles[profile_idx].macros[macro_idx].simple_steps.push(step);
-                    *changed = true;
-                    self.adding_step = false;
-                    self.new_step_action.clear();
-                    self.new_step_hold  = "40".into();
-                    self.new_step_delay = "60".into();
+                // Order field
+                ui.label("Order:");
+                let mut order_val = ev_order;
+                if ui.add(
+                    egui::DragValue::new(&mut order_val)
+                        .speed(1)
+                        .range(-1..=i32::MAX)
+                )
+                .on_hover_text("0 = pre-iter  |  -1 = on release  |  N = every N cycles")
+                .changed()
+                {
+                    set_ev_order = Some((i, order_val));
                 }
+
+                // Macro dropdown — filtered to valid Single macros
+                ui.label("→");
+                let macro_name = valid_targets.iter()
+                    .find(|(id, _)| *id == ev_macro_id)
+                    .map(|(_, n)| n.as_str())
+                    .unwrap_or("(select)");
+                egui::ComboBox::from_id_source(format!("ev_macro_{}", ev_id))
+                    .selected_text(macro_name)
+                    .show_ui(ui, |ui| {
+                        for (mid, mname) in &valid_targets {
+                            if ui.selectable_label(ev_macro_id == *mid, mname).clicked() {
+                                set_ev_macro = Some((i, *mid));
+                            }
+                        }
+                        if valid_targets.is_empty() {
+                            ui.label(
+                                RichText::new("No eligible Single macros")
+                                    .small()
+                                    .color(GRAY),
+                            );
+                        }
+                    });
+
+                // Min loops — only shown for end events
+                if ev_order == -1 {
+                    ui.label("Min loops:");
+                    let mut ml = ev_min_loops;
+                    if ui.add(egui::DragValue::new(&mut ml).speed(1))
+                        .on_hover_text("Minimum complete cycles before this end event fires")
+                        .changed()
+                    {
+                        set_ev_min_loops = Some((i, ml));
+                    }
+                }
+
+                // Delay before invoking the event macro
+                ui.label("Delay (ms):");
+                let mut dms = ev_delay_ms;
+                if ui.add(egui::DragValue::new(&mut dms).speed(1).range(0..=5000))
+                    .on_hover_text("Wait this many milliseconds before firing the event macro")
+                    .changed()
+                {
+                    set_ev_delay = Some((i, dms));
+                }
+
+                // Delete button
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("x").on_hover_text("Remove event").clicked() {
+                        delete_ev = Some(i);
+                    }
+                });
             });
         }
 
-        if ui.small_button("x Cancel").clicked() {
-            self.adding_step = false;
-            self.cancel_learn();
+        // Add event button
+        let first_valid = valid_targets.first().map(|(id, _)| *id);
+        if ui.button("+ Add Event").clicked() {
+            if let Some(target_id) = first_valid.or_else(|| {
+                // Use a nil UUID as placeholder if no valid targets exist yet
+                Some(uuid::Uuid::nil())
+            }) {
+                let ev = LoopEvent {
+                    id: uuid::Uuid::new_v4(),
+                    macro_id: target_id,
+                    order: 1,
+                    min_loops: 0,
+                    delay_ms: 100,
+                };
+                self.profiles[profile_idx].macros[macro_idx].events.push(ev);
+                *changed = true;
+            }
+        }
+
+        // Apply mutations
+        if let Some(i) = delete_ev {
+            self.profiles[profile_idx].macros[macro_idx].events.remove(i);
+            *changed = true;
+        }
+        if let Some((i, mid)) = set_ev_macro {
+            self.profiles[profile_idx].macros[macro_idx].events[i].macro_id = mid;
+            *changed = true;
+        }
+        if let Some((i, order)) = set_ev_order {
+            self.profiles[profile_idx].macros[macro_idx].events[i].order = order;
+            *changed = true;
+        }
+        if let Some((i, ml)) = set_ev_min_loops {
+            self.profiles[profile_idx].macros[macro_idx].events[i].min_loops = ml;
+            *changed = true;
+        }
+        if let Some((i, d)) = set_ev_delay {
+            self.profiles[profile_idx].macros[macro_idx].events[i].delay_ms = d;
+            *changed = true;
         }
     }
 
@@ -1155,7 +1308,6 @@ impl ProfileApp {
                  All fragments in a target must match (case-insensitive) for it to fire. \
                  Any matching target activates this profile. Only one target is registered at a time."
             )
-            .small()
             .color(GRAY),
         );
         ui.separator();
@@ -1285,7 +1437,6 @@ impl ProfileApp {
         ui.heading("Blocked Keys");
         ui.label(
             RichText::new("Keys in this list cannot be used as assignment sources.")
-                .small()
                 .color(GRAY),
         );
         ui.separator();
@@ -1358,7 +1509,6 @@ impl ProfileApp {
         ui.heading("Key Assignments");
         ui.label(
             RichText::new("Map a physical key (+ optional modifiers) to a remap or macro.")
-                .small()
                 .color(GRAY),
         );
         ui.separator();
@@ -1367,134 +1517,205 @@ impl ProfileApp {
         let modifiers: Vec<(Uuid, String)> = self.profile()
             .map(|p| p.modifiers.iter().map(|m| (m.id, m.name.clone())).collect())
             .unwrap_or_default();
-        let macro_list: Vec<(Uuid, String)> = self.profile()
-            .map(|p| p.macros.iter().map(|m| (m.id, m.name.clone())).collect())
+        let macro_list: Vec<(Uuid, String, FireMode)> = self.profile()
+            .map(|p| p.macros.iter().map(|m| (m.id, m.name.clone(), m.fire.clone())).collect())
             .unwrap_or_default();
         let assignment_count = self.profile().map(|p| p.assignments.len()).unwrap_or(0);
 
         let mut delete_assignment: Option<usize> = None;
+        let mut clear_assignment_target: Option<usize> = None;
         let mut start_learn_source: Option<usize> = None;
         let mut start_learn_remap:  Option<usize> = None;
         let mut toggle_modifier: Option<(usize, Uuid)> = None;
         let mut set_target_macro: Option<(usize, Option<Uuid>)> = None;
+        let mut set_trigger_mode: Option<(usize, TriggerMode)> = None;
         let mut clear_device_filter: Option<usize> = None;
+        let mut cancel_learn = false;
         let mut needs_save = false;
 
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for i in 0..assignment_count {
-                let Some(profile_idx) = self.selected else { break };
-                let a = &self.profiles[profile_idx].assignments[i];
+        let has_mods = !modifiers.is_empty();
+        let mod_col_w = (modifiers.len() as f32 * 85.0 + 8.0).max(80.0);
 
-                let source_key    = a.source_key.clone();
-                let source_device = a.source_device.clone();
-                let remap_key     = a.remap_key.clone();
-                let macro_id      = a.macro_id;
-                let held_mods     = a.modifiers.clone();
+        let builder = TableBuilder::new(ui)
+            .striped(true)
+            .vscroll(true)
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(Column::exact(120.0))    // Source Key
+            .column(Column::exact(120.0));   // Source Device
 
-                ui.group(|ui| {
-                    ui.horizontal(|ui| {
-                        // Source key
-                        let source_label = if source_key.is_empty() { "— not set —".into() } else { source_key.clone() };
-                        let is_learning_this = matches!(
-                            self.learn_target,
-                            Some(LearnTarget::AssignmentSource(j)) if j == i
-                        );
-                        if is_learning_this {
-                            ui.spinner();
-                            ui.label("Press a key…");
-                            if ui.small_button("Cancel").clicked() { self.cancel_learn(); }
-                        } else {
-                            if ui.button(&source_label).on_hover_text("Click to re-learn source key").clicked() {
-                                start_learn_source = Some(i);
-                            }
-                        }
+        let builder = if has_mods {
+            builder.column(Column::exact(mod_col_w))  // Modifiers
+        } else {
+            builder
+        };
 
-                        // Device filter badge — shows which device this assignment is locked to
-                        if let Some(ref dev) = source_device {
-                            let label = if dev.len() > 22 { format!("{}…", &dev[..22]) } else { dev.clone() };
-                            ui.label(RichText::new(format!("@{label}")).small().weak())
-                                .on_hover_text(dev.as_str());
-                            if ui.small_button("×").on_hover_text("Clear device filter (match any device)").clicked() {
-                                clear_device_filter = Some(i);
-                            }
-                        }
+        builder
+            .column(Column::remainder())     // Target
+            .column(Column::exact(100.0))    // Trigger
+            .column(Column::exact(55.0))     // Actions
+            .header(20.0, |mut header| {
+                header.col(|ui| { ui.strong("Source Key"); });
+                header.col(|ui| { ui.strong("Source Device"); });
+                if has_mods { header.col(|ui| { ui.strong("Modifiers"); }); }
+                header.col(|ui| { ui.strong("Target"); });
+                header.col(|ui| { ui.strong("Trigger"); });
+                header.col(|ui| {});
+            })
+            .body(|mut body| {
+                for i in 0..assignment_count {
+                    let Some(profile_idx) = self.selected else { return };
+                    let a = &self.profiles[profile_idx].assignments[i];
 
-                        ui.separator();
+                    let source_key    = a.source_key.clone();
+                    let source_device = a.source_device.clone();
+                    let remap_key     = a.remap_key.clone();
+                    let macro_id      = a.macro_id;
+                    let held_mods     = a.modifiers.clone();
+                    let trigger_mode  = a.trigger_mode.clone();
 
-                        // Modifier toggles
-                        if !modifiers.is_empty() {
-                            ui.label("+");
-                            for (mod_id, mod_name) in &modifiers {
-                                let active = held_mods.contains(mod_id);
-                                let mut flag = active;
-                                if ui.checkbox(&mut flag, mod_name).changed() {
-                                    toggle_modifier = Some((i, *mod_id));
+                    body.row(24.0, |mut row| {
+                        // Source Key
+                        row.col(|ui| {
+                            let is_learning = matches!(
+                                self.learn_target,
+                                Some(LearnTarget::AssignmentSource(j)) if j == i
+                            );
+                            if is_learning {
+                                ui.spinner();
+                                ui.label("Press a key…");
+                                if ui.small_button("Cancel").clicked() { cancel_learn = true; }
+                            } else {
+                                let label = if source_key.is_empty() { "— not set —".into() } else { source_key.clone() };
+                                if ui.button(&label).on_hover_text("Click to re-learn source key").clicked() {
+                                    start_learn_source = Some(i);
                                 }
                             }
-                            ui.separator();
+                        });
+
+                        // Source Device
+                        row.col(|ui| {
+                            if let Some(ref dev) = source_device {
+                                let short = if dev.len() > 12 { format!("{}…", &dev[..12]) } else { dev.clone() };
+                                ui.label(RichText::new(&short).small().weak())
+                                    .on_hover_text(dev.as_str());
+                                if ui.small_button("x").on_hover_text("Clear device filter").clicked() {
+                                    clear_device_filter = Some(i);
+                                }
+                            }
+                        });
+
+                        // Modifiers (only present as a column when has_mods)
+                        if has_mods {
+                            row.col(|ui| {
+                                for (mod_id, mod_name) in &modifiers {
+                                    let active = held_mods.contains(mod_id);
+                                    let mut flag = active;
+                                    if ui.checkbox(&mut flag, mod_name).changed() {
+                                        toggle_modifier = Some((i, *mod_id));
+                                    }
+                                }
+                            });
                         }
 
                         // Target
-                        ui.label("→");
-                        let is_learning_remap = matches!(
-                            self.learn_target,
-                            Some(LearnTarget::AssignmentRemap(j)) if j == i
-                        );
-                        if is_learning_remap {
-                            ui.spinner();
-                            ui.label("Press target key…");
-                            if ui.small_button("Cancel").clicked() { self.cancel_learn(); }
-                        } else {
-                            // Remap key button
-                            let remap_label = remap_key.as_deref().unwrap_or("Key…");
-                            if ui.button(remap_label)
-                                .on_hover_text("Click to learn remap target key")
-                                .clicked()
-                                && macro_id.is_none()
-                            {
-                                start_learn_remap = Some(i);
-                            }
-
-                            ui.label("or");
-
-                            // Macro dropdown
-                            let macro_name = macro_id
-                                .and_then(|mid| macro_list.iter().find(|(id, _)| *id == mid))
-                                .map(|(_, n)| n.as_str())
-                                .unwrap_or("Macro…");
-                            let mut chosen_macro = macro_id;
-                            egui::ComboBox::from_id_source(format!("assign_macro_{i}"))
-                                .selected_text(macro_name)
-                                .show_ui(ui, |ui| {
-                                    if ui.selectable_label(macro_id.is_none(), "None").clicked() {
-                                        set_target_macro = Some((i, None));
-                                    }
-                                    for (mid, mname) in &macro_list {
-                                        if ui.selectable_label(chosen_macro == Some(*mid), mname).clicked() {
-                                            set_target_macro = Some((i, Some(*mid)));
-                                            chosen_macro = Some(*mid);
+                        row.col(|ui| {
+                            let is_learning_remap = matches!(
+                                self.learn_target,
+                                Some(LearnTarget::AssignmentRemap(j)) if j == i
+                            );
+                            if is_learning_remap {
+                                ui.spinner();
+                                ui.label("Press target key…");
+                                if ui.small_button("Cancel").clicked() { cancel_learn = true; }
+                            } else if remap_key.is_some() {
+                                if ui.button(remap_key.as_deref().unwrap_or("Key…"))
+                                    .on_hover_text("Click to re-learn remap target key")
+                                    .clicked()
+                                {
+                                    start_learn_remap = Some(i);
+                                }
+                            } else if macro_id.is_some() {
+                                let macro_name = macro_id
+                                    .and_then(|mid| macro_list.iter().find(|(id, _, _)| *id == mid))
+                                    .map(|(_, n, _)| n.as_str())
+                                    .unwrap_or("(missing)");
+                                let mut chosen = macro_id;
+                                egui::ComboBox::from_id_source(format!("assign_macro_{i}"))
+                                    .selected_text(macro_name)
+                                    .width(ui.available_width())
+                                    .show_ui(ui, |ui| {
+                                        for (mid, mname, _) in &macro_list {
+                                            if ui.selectable_label(chosen == Some(*mid), mname).clicked() {
+                                                set_target_macro = Some((i, Some(*mid)));
+                                                chosen = Some(*mid);
+                                            }
                                         }
-                                    }
-                                });
-                        }
+                                    });
+                            } else {
+                                if ui.button("Key…").on_hover_text("Click to learn a remap target key").clicked() {
+                                    start_learn_remap = Some(i);
+                                }
+                                ui.label("or");
+                                egui::ComboBox::from_id_source(format!("assign_macro_{i}"))
+                                    .selected_text("Macro…")
+                                    .show_ui(ui, |ui| {
+                                        for (mid, mname, _) in &macro_list {
+                                            if ui.selectable_label(false, mname).clicked() {
+                                                set_target_macro = Some((i, Some(*mid)));
+                                            }
+                                        }
+                                    });
+                            }
+                        });
 
-                        // Delete
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("x").clicked() {
+                        // Trigger
+                        row.col(|ui| {
+                            let is_single = macro_id
+                                .and_then(|mid| macro_list.iter().find(|(id, _, _)| *id == mid))
+                                .map(|(_, _, fire)| *fire == FireMode::Single)
+                                .unwrap_or(false);
+                            if is_single {
+                                egui::ComboBox::from_id_source(format!("assign_trigger_{i}"))
+                                    .selected_text(trigger_mode_label(&trigger_mode))
+                                    .width(ui.available_width())
+                                    .show_ui(ui, |ui| {
+                                        for mode in [TriggerMode::Any, TriggerMode::QuickPress, TriggerMode::ShortHold] {
+                                            let lbl = trigger_mode_label(&mode);
+                                            if ui.selectable_label(trigger_mode == mode, lbl).clicked() {
+                                                set_trigger_mode = Some((i, mode));
+                                            }
+                                        }
+                                    });
+                            }
+                        });
+
+                        // Actions
+                        row.col(|ui| {
+                            if ui.small_button("Clr").on_hover_text("Clear macro or remap target").clicked() {
+                                clear_assignment_target = Some(i);
+                            }
+                            if ui.small_button("Del").on_hover_text("Delete assignment").clicked() {
                                 delete_assignment = Some(i);
                             }
                         });
                     });
-                });
-                ui.add_space(2.0);
-            }
-        });
+                }
+            });
+
+        if cancel_learn { self.cancel_learn(); }
 
         // Apply mutations
         let Some(profile_idx) = self.selected else { return };
 
         if let Some(i) = delete_assignment {
             self.profiles[profile_idx].assignments.remove(i);
+            needs_save = true;
+        }
+        if let Some(i) = clear_assignment_target {
+            let a = &mut self.profiles[profile_idx].assignments[i];
+            a.macro_id = None;
+            a.remap_key = None;
+            a.trigger_mode = TriggerMode::Any;
             needs_save = true;
         }
         if let Some(i) = start_learn_source {
@@ -1516,6 +1737,13 @@ impl ProfileApp {
             let a = &mut self.profiles[profile_idx].assignments[i];
             a.macro_id  = mid;
             a.remap_key = if mid.is_some() { None } else { a.remap_key.clone() };
+            if mid.is_none() {
+                a.trigger_mode = TriggerMode::Any;
+            }
+            needs_save = true;
+        }
+        if let Some((i, mode)) = set_trigger_mode {
+            self.profiles[profile_idx].assignments[i].trigger_mode = mode;
             needs_save = true;
         }
         if let Some(i) = clear_device_filter {
@@ -1556,6 +1784,63 @@ impl ProfileApp {
                 }
             });
         }
+    }
+
+    // ── Engine log section ────────────────────────────────────────────────────
+
+    fn show_log(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let was = self.log_enabled;
+            if ui.checkbox(&mut self.log_enabled, "Enable engine logging").changed() {
+                crate::engine::set_engine_logging(self.log_enabled);
+                if !was {
+                    crate::engine::clear_engine_log();
+                    self.log_entries.clear();
+                }
+            }
+            if ui.button("Clear").clicked() {
+                self.log_entries.clear();
+                crate::engine::clear_engine_log();
+            }
+            ui.label(
+                RichText::new(format!("{} entries", self.log_entries.len()))
+                    .small()
+                    .color(GRAY),
+            );
+        });
+        ui.separator();
+        if !self.log_enabled && self.log_entries.is_empty() {
+            ui.colored_label(GRAY, "Enable logging above, then trigger a macro.");
+            return;
+        }
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                for entry in &self.log_entries {
+                    ui.monospace(entry);
+                }
+            });
+    }
+}
+
+// ── Trigger mode label ────────────────────────────────────────────────────────
+
+fn trigger_mode_label(mode: &TriggerMode) -> &'static str {
+    match mode {
+        TriggerMode::Any        => "Any",
+        TriggerMode::QuickPress => "< 50 ms",
+        TriggerMode::ShortHold  => "50–200 ms",
+    }
+}
+
+// ── Debug launcher ────────────────────────────────────────────────────────────
+
+fn spawn_debug(mode: &str) {
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::process::Command::new(exe)
+            .args(["debug", "--mode", mode])
+            .spawn();
     }
 }
 
@@ -1682,7 +1967,7 @@ impl eframe::App for ProfileApp {
         // Poll macro recording every frame
         self.poll_recording();
         if self.recording {
-            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            ctx.request_repaint_after(std::time::Duration::from_millis(crate::constants::UI_REPAINT_FAST_MS));
         }
 
         // Poll key learning every frame
@@ -1691,7 +1976,7 @@ impl eframe::App for ProfileApp {
             if matches!(self.learn_target, Some(LearnTarget::AssignmentSource(usize::MAX))) {
                 self.learn_target  = None;
                 self.learn_handles = Vec::new(); // stop remaining reader threads
-                if let Some(msg) = self.assignment_guard(&key, &[], Some(&device), usize::MAX) {
+                if let Some(msg) = self.assignment_guard(&key, &[], Some(&device), &TriggerMode::Any, usize::MAX) {
                     self.warn_popup = Some(msg);
                 } else if let Some(p) = self.profile_mut() {
                     let mut a = KeyAssignment::new(key);
@@ -1705,7 +1990,7 @@ impl eframe::App for ProfileApp {
             }
         }
         if self.learn_rx.is_some() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            ctx.request_repaint_after(std::time::Duration::from_millis(crate::constants::UI_REPAINT_FAST_MS));
         }
 
         // Auto-detect scanner lifecycle
@@ -1739,7 +2024,21 @@ impl eframe::App for ProfileApp {
                 }
                 None => {}
             }
-            ctx.request_repaint_after(std::time::Duration::from_secs(10));
+            ctx.request_repaint_after(std::time::Duration::from_secs(crate::constants::UI_REPAINT_AUTODETECT_SECS));
+        }
+
+        // Drain engine log when enabled
+        if self.log_enabled {
+            let new = crate::engine::drain_engine_log();
+            if !new.is_empty() {
+                self.log_entries.extend(new);
+                if self.log_entries.len() > crate::constants::ENGINE_LOG_CAPACITY {
+                    let excess = self.log_entries.len() - crate::constants::ENGINE_LOG_CAPACITY;
+                    self.log_entries.drain(0..excess);
+                }
+                ctx.request_repaint();
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(crate::constants::UI_REPAINT_NORMAL_MS));
         }
 
         self.show_new_profile_dialog(ctx);
@@ -1768,8 +2067,10 @@ impl eframe::App for ProfileApp {
             ui.add_space(4.0);
 
             let mut new_sel: Option<usize> = None;
+            let scroll_height = (ui.available_height() - 52.0).max(40.0);
             egui::ScrollArea::vertical()
                 .id_source("profile_list_scroll")
+                .max_height(scroll_height)
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
                     for (i, p) in self.profiles.iter().enumerate() {
@@ -1785,16 +2086,34 @@ impl eframe::App for ProfileApp {
                     self.selected_macro = None;
                 }
             }
+
+            ui.add_space(4.0);
+            ui.separator();
+            ui.label(RichText::new("Debug").small().color(GRAY));
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                if ui.small_button("Capture").on_hover_text("Open key capture tool").clicked() {
+                    spawn_debug("capture");
+                }
+                if ui.small_button("Log").on_hover_text("Open continuous event log").clicked() {
+                    spawn_debug("log");
+                }
+                if ui.small_button("HID").on_hover_text("Open raw HID probe").clicked() {
+                    spawn_debug("hid");
+                }
+            });
         });
 
-        if self.selected.is_some() {
-            egui::SidePanel::left("nav_panel").exact_width(110.0).show(ctx, |ui| {
-                ui.add_space(4.0);
-                self.show_nav(ui);
-            });
-        }
+        egui::SidePanel::left("nav_panel").exact_width(110.0).show(ctx, |ui| {
+            ui.add_space(4.0);
+            self.show_nav(ui);
+        });
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            if self.section == Section::Log {
+                self.show_log(ui);
+                return;
+            }
             if self.selected.is_none() {
                 ui.centered_and_justified(|ui| {
                     ui.label(
@@ -1811,6 +2130,7 @@ impl eframe::App for ProfileApp {
                 Section::Assignments => self.show_assignments(ui),
                 Section::Blocked     => self.show_blocked(ui),
                 Section::AutoDetect  => self.show_auto_detect(ui),
+                Section::Log         => unreachable!(),
             }
         });
     }

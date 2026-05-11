@@ -10,9 +10,9 @@ use crate::hidraw::{self, HidRawDevice};
 pub const BUTTON_COUNT: u32 = 12;
 
 /// Linux key codes for side buttons 1–12.
-/// Maps button index 0–11 to KEY_MACRO1–KEY_MACRO12 (0x290–0x29B).
+/// Maps button index 0–11 to KEY_MACRO1–KEY_MACRO12.
 pub fn keycode(button_index: u32) -> u16 {
-    0x290 + button_index as u16
+    crate::constants::KEY_MACRO_BASE + button_index as u16
 }
 
 /// HID keyboard keycodes reported by the Venus for side buttons 1–12.
@@ -312,7 +312,7 @@ mod tests {
 
     #[test]
     fn keycode_range() {
-        assert_eq!(keycode(0),  0x290); // KEY_MACRO1
-        assert_eq!(keycode(11), 0x29B); // KEY_MACRO12
+        assert_eq!(keycode(0),  crate::constants::KEY_MACRO_BASE);
+        assert_eq!(keycode(11), crate::constants::KEY_MACRO_BASE + 11);
     }
 }

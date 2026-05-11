@@ -34,9 +34,9 @@ pub fn names(mask: u32) -> String {
         .join("+")
 }
 
-/// Linux key codes for G1–G18 (KEY_MACRO1–KEY_MACRO18, starting at 0x290).
+/// Linux key codes for G1–G18 (KEY_MACRO1–KEY_MACRO18).
 pub fn keycode(gkey_index: u32) -> u16 {
-    0x290 + gkey_index as u16
+    crate::constants::KEY_MACRO_BASE + gkey_index as u16
 }
 
 #[cfg(test)]

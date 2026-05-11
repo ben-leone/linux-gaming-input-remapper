@@ -102,7 +102,7 @@ pub fn start_readers(
                 return;
             };
 
-            let mut buf = [0u8; 64];
+            let mut buf = [0u8; crate::constants::HID_READ_BUF_SIZE];
             let mut prev: Vec<u8> = Vec::new();
 
             loop {

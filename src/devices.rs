@@ -317,10 +317,11 @@ fn classify(
 }
 
 fn is_gaming_key(code: u16) -> bool {
+    use crate::constants::*;
     matches!(code,
-        0x290..=0x2AD  // KEY_MACRO1–KEY_MACRO30
-        | 0x2C0..=0x2E7  // BTN_TRIGGER_HAPPY1–BTN_TRIGGER_HAPPY40
-        | 183..=194      // KEY_F13–KEY_F24
-        | 149..=152      // KEY_PROG1–KEY_PROG4
+        KEY_MACRO_BASE..=KEY_MACRO_MAX
+        | BTN_TRIGGER_HAPPY_BASE..=BTN_TRIGGER_HAPPY_MAX
+        | 183..=194   // KEY_F13–KEY_F24
+        | 149..=152   // KEY_PROG1–KEY_PROG4
     )
 }

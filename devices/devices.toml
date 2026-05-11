@@ -16,6 +16,13 @@ type    = ["keyboard"]
 
 [[device]]
 vendor  = 0x046d
+product = 0xc08b
+name    = "Logitech G502 SE HERO"
+type    = ["mouse"]
+extra_keys = "rear, forward (next to left click) → KEY_MACRO1, KEY_MACRO2"
+
+[[device]]
+vendor  = 0x046d
 product = 0xc33f
 name    = "Logitech G815"
 type    = ["keyboard"]

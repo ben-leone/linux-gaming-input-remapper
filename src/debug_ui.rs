@@ -25,10 +25,20 @@ enum SetupState {
 }
 
 #[derive(PartialEq, Clone, Copy)]
-enum ViewMode {
+pub enum ViewMode {
     SingleCapture,
     ContinuousLog,
     HidProbe,
+}
+
+impl ViewMode {
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "log"  => Self::ContinuousLog,
+            "hid"  => Self::HidProbe,
+            _      => Self::SingleCapture,
+        }
+    }
 }
 
 enum CaptureState {
@@ -40,7 +50,8 @@ enum CaptureState {
 const COLOR_UNKNOWN: egui::Color32 = egui::Color32::from_rgb(255, 80,  80);
 const COLOR_GAMING:  egui::Color32 = egui::Color32::from_rgb(255, 200, 50);
 
-pub fn run() {
+pub fn run(mode: &str) {
+    let initial_mode = ViewMode::from_str(mode);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 700.0])
@@ -51,7 +62,7 @@ pub fn run() {
     eframe::run_native(
         "gameremap Key Monitor",
         options,
-        Box::new(|_cc| Ok(Box::new(DebugApp::new()))),
+        Box::new(move |_cc| Ok(Box::new(DebugApp::new(initial_mode)))),
     )
     .unwrap_or_else(|e| eprintln!("UI error: {e}"));
 }
@@ -96,7 +107,7 @@ struct DebugApp {
 }
 
 impl DebugApp {
-    fn new() -> Self {
+    fn new(initial_mode: ViewMode) -> Self {
         let (show_permission_popup, no_devices) = match devices::check_access() {
             AccessStatus::Ok        => (false, false),
             AccessStatus::Denied    => (true,  false),
@@ -126,7 +137,7 @@ impl DebugApp {
             setup_rx: None,
             teardown_state: SetupState::Idle,
             teardown_rx: None,
-            view_mode: ViewMode::SingleCapture,
+            view_mode: initial_mode,
             capture_state: CaptureState::Idle,
             selected_evdev: HashSet::new(),
             selected_hid: HashSet::new(),
@@ -838,6 +849,6 @@ impl eframe::App for DebugApp {
             }
         });
 
-        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        ctx.request_repaint_after(std::time::Duration::from_millis(crate::constants::DEBUG_UI_REPAINT_MS));
     }
 }
