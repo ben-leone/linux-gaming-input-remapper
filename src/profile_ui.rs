@@ -1675,17 +1675,21 @@ impl ProfileApp {
                                 .map(|(_, _, fire)| *fire == FireMode::Single)
                                 .unwrap_or(false);
                             if is_single {
-                                egui::ComboBox::from_id_source(format!("assign_trigger_{i}"))
+                                let cb = egui::ComboBox::from_id_source(format!("assign_trigger_{i}"))
                                     .selected_text(trigger_mode_label(&trigger_mode))
                                     .width(ui.available_width())
                                     .show_ui(ui, |ui| {
                                         for mode in [TriggerMode::Any, TriggerMode::QuickPress, TriggerMode::ShortHold] {
                                             let lbl = trigger_mode_label(&mode);
-                                            if ui.selectable_label(trigger_mode == mode, lbl).clicked() {
+                                            if ui.selectable_label(trigger_mode == mode, lbl)
+                                                .on_hover_text(trigger_mode_tooltip(&mode))
+                                                .clicked()
+                                            {
                                                 set_trigger_mode = Some((i, mode));
                                             }
                                         }
                                     });
+                                cb.response.on_hover_text(trigger_mode_tooltip(&trigger_mode));
                             }
                         });
 
@@ -1829,8 +1833,16 @@ impl ProfileApp {
 fn trigger_mode_label(mode: &TriggerMode) -> &'static str {
     match mode {
         TriggerMode::Any        => "Any",
-        TriggerMode::QuickPress => "< 50 ms",
-        TriggerMode::ShortHold  => "50–200 ms",
+        TriggerMode::QuickPress => "Short",
+        TriggerMode::ShortHold  => "Long",
+    }
+}
+
+fn trigger_mode_tooltip(mode: &TriggerMode) -> &'static str {
+    match mode {
+        TriggerMode::Any        => "Fire on any press duration",
+        TriggerMode::QuickPress => "Short press: < 250 ms",
+        TriggerMode::ShortHold  => "Long press: 250–500 ms",
     }
 }
 

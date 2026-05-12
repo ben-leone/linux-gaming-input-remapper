@@ -1,10 +1,10 @@
 // ── Engine: trigger timing ────────────────────────────────────────────────────
 
 /// Upper bound (ms) for a QuickPress trigger: hold shorter than this → quick press.
-pub const QUICK_PRESS_MAX_MS: u64 = 50;
+pub const QUICK_PRESS_MAX_MS: u64 = 250;
 
 /// Upper bound (ms) for a ShortHold trigger: hold between QUICK_PRESS_MAX_MS and this → short hold.
-pub const SHORT_HOLD_MAX_MS: u64 = 200;
+pub const SHORT_HOLD_MAX_MS: u64 = 500;
 
 // ── Engine: lifecycle timing ──────────────────────────────────────────────────
 

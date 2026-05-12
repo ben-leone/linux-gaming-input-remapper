@@ -146,6 +146,18 @@ sudo gpasswd -d $USER input   # optional: remove from input group
 
 ---
 
+## Troubleshooting
+
+### `uinput init: No such device (os error 19)`
+
+This error means the kernel's `uinput` module isn't loaded. The most common cause is a **system update that replaced the kernel** — the new kernel's modules haven't been initialized yet because the machine hasn't been rebooted since the update.
+
+**Fix: restart your computer.** After a full reboot the new kernel loads `uinput` on demand and the error goes away.
+
+If the error persists after rebooting, make sure the one-time permission setup has been run (see [One-Time Permission Setup](#one-time-permission-setup) above).
+
+---
+
 
 ## Contributors
 
