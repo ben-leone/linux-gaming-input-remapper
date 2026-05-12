@@ -1,6 +1,5 @@
 # GameRemapper
 
-Copyright (C) 2026 Ben Leone — licensed under the [GNU General Public License v3.0](LICENSE).
 
 A Linux gaming input remapper with per-game profiles, precise macro timing, and support for gaming mice with extra buttons. Run it when you want remapping; close it to stop.
 
@@ -168,3 +167,5 @@ If the error persists after rebooting, make sure the one-time permission setup h
 | Boots | Senior Code Reviewer |
 | Rabbit | Senior Code Reviewer |
 | Google Gemini | App icon |
+
+
