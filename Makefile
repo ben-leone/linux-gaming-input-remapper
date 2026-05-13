@@ -37,7 +37,7 @@ run-debug: ## Run key monitor debug window
 	cargo run -- debug
 
 run: ## Run the AppImage profile editor (requires 'make package' first)
-	$(APPIMAGE_OUT) profile
+	$(APPIMAGE_OUT)
 
 # ── AppImage packaging (binary must already exist) ───────────────────
 
