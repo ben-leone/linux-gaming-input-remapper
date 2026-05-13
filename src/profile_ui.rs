@@ -69,8 +69,6 @@ pub struct ProfileApp {
 
     // Modifiers panel
     adding_modifier: bool,
-    new_mod_key:     String,
-    new_mod_name:    String,
 
     // Macros panel
     selected_macro:  Option<usize>,
@@ -134,8 +132,6 @@ impl ProfileApp {
             learn_rx:      None,
             learn_handles: Vec::new(),
             adding_modifier: false,
-            new_mod_key:     String::new(),
-            new_mod_name:    String::new(),
             selected_macro:  None,
             adding_step:     false,
             new_step_action: String::new(),
@@ -192,8 +188,14 @@ impl ProfileApp {
     }
 
     fn start_learn(&mut self, target: LearnTarget) {
+        let mod_keys: Vec<String> = match &target {
+            LearnTarget::AssignmentSource(_) | LearnTarget::AssignmentRemap(_) => self.profile()
+                .map(|p| p.modifiers.iter().map(|m| m.key.clone()).collect())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
         self.learn_target = Some(target);
-        let (rx, handles) = start_key_learn();
+        let (rx, handles) = start_key_learn(mod_keys);
         self.learn_rx      = Some(rx);
         self.learn_handles = handles;
     }
@@ -256,7 +258,13 @@ impl ProfileApp {
         let Some(target) = self.learn_target.take() else { return };
         match target {
             LearnTarget::NewModifier => {
-                self.new_mod_key = key;
+                let mut m = ModifierKey::new(&key, &key);
+                m.source_device = if device.is_empty() { None } else { Some(device) };
+                if let Some(p) = self.profile_mut() {
+                    p.modifiers.push(m);
+                }
+                self.adding_modifier = false;
+                self.save_current();
             }
             LearnTarget::NewMacroStep => {
                 if let (Some(profile_idx), Some(macro_idx)) = (self.selected, self.selected_macro) {
@@ -272,16 +280,26 @@ impl ProfileApp {
                 }
             }
             LearnTarget::AssignmentSource(idx) => {
-                let (mods, trigger_mode) = self.profile()
-                    .and_then(|p| p.assignments.get(idx))
-                    .map(|a| (a.modifiers.clone(), a.trigger_mode.clone()))
+                let parts: Vec<&str> = key.split('+').collect();
+                let actual_key = parts.last().copied().unwrap_or(&key).to_string();
+                let held_names: &[&str] = if parts.len() > 1 { &parts[..parts.len()-1] } else { &[] };
+                let mod_uuids: Vec<Uuid> = self.profile()
+                    .map(|p| p.modifiers.iter()
+                        .filter(|m| held_names.contains(&m.key.as_str()))
+                        .map(|m| m.id)
+                        .collect())
                     .unwrap_or_default();
-                if let Some(msg) = self.assignment_guard(&key, &mods, Some(&device), &trigger_mode, idx) {
+                let trigger_mode = self.profile()
+                    .and_then(|p| p.assignments.get(idx))
+                    .map(|a| a.trigger_mode.clone())
+                    .unwrap_or_default();
+                if let Some(msg) = self.assignment_guard(&actual_key, &mod_uuids, Some(&device), &trigger_mode, idx) {
                     self.warn_popup = Some(msg);
                 } else {
                     if let Some(a) = self.profile_mut().and_then(|p| p.assignments.get_mut(idx)) {
-                        a.source_key = key;
+                        a.source_key    = actual_key;
                         a.source_device = Some(device);
+                        a.modifiers     = mod_uuids;
                     }
                     self.save_current();
                 }
@@ -634,24 +652,33 @@ impl ProfileApp {
         ui.separator();
 
         // Collect modifiers snapshot for rendering (avoids borrow conflict with profile_mut)
-        let modifiers: Vec<(Uuid, String, String)> = self.profile()
-            .map(|p| p.modifiers.iter().map(|m| (m.id, m.key.clone(), m.name.clone())).collect())
+        let modifiers: Vec<(Uuid, String, String, Option<String>)> = self.profile()
+            .map(|p| p.modifiers.iter()
+                .map(|m| (m.id, m.key.clone(), m.name.clone(), m.source_device.clone()))
+                .collect())
             .unwrap_or_default();
 
         let mut delete_idx: Option<usize> = None;
 
         egui::Grid::new("mod_grid")
-            .num_columns(3)
+            .num_columns(4)
             .striped(true)
-            .min_col_width(140.0)
+            .min_col_width(120.0)
             .show(ui, |ui| {
                 ui.strong("Key");
+                ui.strong("Device");
                 ui.strong("Name");
                 ui.label("");
                 ui.end_row();
 
-                for (i, (_, key, name)) in modifiers.iter().enumerate() {
+                for (i, (_, key, name, device)) in modifiers.iter().enumerate() {
                     ui.label(key);
+                    if let Some(dev) = device {
+                        let short = if dev.len() > 16 { format!("{}…", &dev[..16]) } else { dev.clone() };
+                        ui.label(RichText::new(&short).small().weak()).on_hover_text(dev.as_str());
+                    } else {
+                        ui.label(RichText::new("any").small().color(GRAY));
+                    }
                     ui.label(name);
                     if ui.small_button("x").on_hover_text("Remove").clicked() {
                         delete_idx = Some(i);
@@ -679,58 +706,19 @@ impl ProfileApp {
         if !self.adding_modifier {
             if ui.button("+ Add Modifier").clicked() {
                 self.adding_modifier = true;
-                self.new_mod_key.clear();
-                self.new_mod_name.clear();
+                self.start_learn(LearnTarget::NewModifier);
             }
             return;
         }
 
-        let is_learning = matches!(self.learn_target, Some(LearnTarget::NewModifier));
-
         ui.horizontal(|ui| {
-            if is_learning {
-                ui.spinner();
-                ui.label("Press a key…");
-                if ui.small_button("Cancel").clicked() {
-                    self.cancel_learn();
-                }
-            } else if ui.button("Learn Key").clicked() {
-                self.start_learn(LearnTarget::NewModifier);
+            ui.spinner();
+            ui.label("Press a key…");
+            if ui.small_button("Cancel").clicked() {
+                self.adding_modifier = false;
+                self.cancel_learn();
             }
         });
-
-        if !self.new_mod_key.is_empty() {
-            ui.horizontal(|ui| {
-                ui.label("Captured:");
-                ui.strong(&self.new_mod_key.clone());
-                ui.label("Name:");
-                ui.text_edit_singleline(&mut self.new_mod_name);
-
-                let can_add = !self.new_mod_name.trim().is_empty();
-                let mut add = false;
-                ui.add_enabled_ui(can_add, |ui| {
-                    if ui.button("Add").clicked() { add = true; }
-                });
-                if add {
-                    let m = ModifierKey::new(
-                        self.new_mod_key.trim(),
-                        self.new_mod_name.trim(),
-                    );
-                    if let Some(p) = self.profile_mut() {
-                        p.modifiers.push(m);
-                    }
-                    self.save_current();
-                    self.adding_modifier = false;
-                    self.new_mod_key.clear();
-                    self.new_mod_name.clear();
-                }
-            });
-        }
-
-        if ui.small_button("x Cancel").clicked() {
-            self.adding_modifier = false;
-            self.cancel_learn();
-        }
     }
 
     // ── Macros section ────────────────────────────────────────────────────────
@@ -1526,37 +1514,24 @@ impl ProfileApp {
         let mut clear_assignment_target: Option<usize> = None;
         let mut start_learn_source: Option<usize> = None;
         let mut start_learn_remap:  Option<usize> = None;
-        let mut toggle_modifier: Option<(usize, Uuid)> = None;
         let mut set_target_macro: Option<(usize, Option<Uuid>)> = None;
         let mut set_trigger_mode: Option<(usize, TriggerMode)> = None;
         let mut clear_device_filter: Option<usize> = None;
         let mut cancel_learn = false;
         let mut needs_save = false;
 
-        let has_mods = !modifiers.is_empty();
-        let mod_col_w = (modifiers.len() as f32 * 85.0 + 8.0).max(80.0);
-
-        let builder = TableBuilder::new(ui)
+        TableBuilder::new(ui)
             .striped(true)
             .vscroll(true)
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .column(Column::exact(120.0))    // Source Key
-            .column(Column::exact(120.0));   // Source Device
-
-        let builder = if has_mods {
-            builder.column(Column::exact(mod_col_w))  // Modifiers
-        } else {
-            builder
-        };
-
-        builder
-            .column(Column::remainder())     // Target
-            .column(Column::exact(100.0))    // Trigger
-            .column(Column::exact(55.0))     // Actions
+            .column(Column::initial(160.0).resizable(true))  // Source Key (with modifiers)
+            .column(Column::initial(120.0).resizable(true))  // Source Device
+            .column(Column::initial(200.0).resizable(true))  // Target
+            .column(Column::exact(100.0))                    // Trigger
+            .column(Column::exact(55.0))                     // Actions
             .header(20.0, |mut header| {
                 header.col(|ui| { ui.strong("Source Key"); });
                 header.col(|ui| { ui.strong("Source Device"); });
-                if has_mods { header.col(|ui| { ui.strong("Modifiers"); }); }
                 header.col(|ui| { ui.strong("Target"); });
                 header.col(|ui| { ui.strong("Trigger"); });
                 header.col(|ui| {});
@@ -1573,6 +1548,17 @@ impl ProfileApp {
                     let held_mods     = a.modifiers.clone();
                     let trigger_mode  = a.trigger_mode.clone();
 
+                    // Build "ModName + ModName + KEY" display for the source key.
+                    let source_label: String = if held_mods.is_empty() || source_key.is_empty() {
+                        if source_key.is_empty() { "— not set —".into() } else { source_key.clone() }
+                    } else {
+                        let mod_labels: Vec<&str> = modifiers.iter()
+                            .filter(|(id, _)| held_mods.contains(id))
+                            .map(|(_, name)| name.as_str())
+                            .collect();
+                        format!("{} + {}", mod_labels.join(" + "), source_key)
+                    };
+
                     body.row(24.0, |mut row| {
                         // Source Key
                         row.col(|ui| {
@@ -1585,8 +1571,10 @@ impl ProfileApp {
                                 ui.label("Press a key…");
                                 if ui.small_button("Cancel").clicked() { cancel_learn = true; }
                             } else {
-                                let label = if source_key.is_empty() { "— not set —".into() } else { source_key.clone() };
-                                if ui.button(&label).on_hover_text("Click to re-learn source key").clicked() {
+                                if ui.button(&source_label)
+                                    .on_hover_text("Click to re-learn source key")
+                                    .clicked()
+                                {
                                     start_learn_source = Some(i);
                                 }
                             }
@@ -1604,19 +1592,6 @@ impl ProfileApp {
                             }
                         });
 
-                        // Modifiers (only present as a column when has_mods)
-                        if has_mods {
-                            row.col(|ui| {
-                                for (mod_id, mod_name) in &modifiers {
-                                    let active = held_mods.contains(mod_id);
-                                    let mut flag = active;
-                                    if ui.checkbox(&mut flag, mod_name).changed() {
-                                        toggle_modifier = Some((i, *mod_id));
-                                    }
-                                }
-                            });
-                        }
-
                         // Target
                         row.col(|ui| {
                             let is_learning_remap = matches!(
@@ -1628,7 +1603,9 @@ impl ProfileApp {
                                 ui.label("Press target key…");
                                 if ui.small_button("Cancel").clicked() { cancel_learn = true; }
                             } else if remap_key.is_some() {
-                                if ui.button(remap_key.as_deref().unwrap_or("Key…"))
+                                let label = remap_key.as_deref().unwrap_or("Key…")
+                                    .split('+').collect::<Vec<_>>().join(" + ");
+                                if ui.button(&label)
                                     .on_hover_text("Click to re-learn remap target key")
                                     .clicked()
                                 {
@@ -1728,15 +1705,6 @@ impl ProfileApp {
         if let Some(i) = start_learn_remap {
             self.start_learn(LearnTarget::AssignmentRemap(i));
         }
-        if let Some((i, mod_id)) = toggle_modifier {
-            let a = &mut self.profiles[profile_idx].assignments[i];
-            if a.modifiers.contains(&mod_id) {
-                a.modifiers.retain(|&id| id != mod_id);
-            } else {
-                a.modifiers.push(mod_id);
-            }
-            needs_save = true;
-        }
         if let Some((i, mid)) = set_target_macro {
             let a = &mut self.profiles[profile_idx].assignments[i];
             a.macro_id  = mid;
@@ -1770,10 +1738,7 @@ impl ProfileApp {
         if !self.adding_assignment {
             if ui.button("+ New Assignment").clicked() {
                 self.adding_assignment = true;
-                self.learn_target = Some(LearnTarget::AssignmentSource(usize::MAX));
-                let (rx, handles) = start_key_learn();
-                self.learn_rx      = Some(rx);
-                self.learn_handles = handles;
+                self.start_learn(LearnTarget::AssignmentSource(usize::MAX));
             }
             return;
         }
@@ -1858,25 +1823,36 @@ fn spawn_debug(mode: &str) {
 
 // ── Key learning helper ───────────────────────────────────────────────────────
 
-/// Spawns one reader thread per evdev device (all devices — we don't know which
-/// the user will press).  Only EV_KEY press events reach the channel; mouse
-/// movement (EV_REL / EV_ABS) is structurally excluded.
+/// Spawns one reader thread per evdev device.
 ///
-/// A 150 ms timestamp gate prevents the click that triggered "Learn" from being
-/// captured as the target key.
+/// When `profile_mod_keys` is non-empty those evdev key names are treated as
+/// modifiers: their state is tracked globally across all device threads (so the
+/// modifier and key may come from different physical devices), and when a
+/// non-modifier key is pressed with modifiers held the result is a
+/// `+`-delimited compound string such as `"KEY_MACRO1+KEY_A"`.  The returned
+/// device name is always the device that produced the non-modifier key.
 ///
-/// Returns a channel receiver AND a set of `DeviceReader` handles.  Dropping
-/// the handles stops all threads, so the caller must keep them alive for the
-/// duration of the learn session and drop them when learning ends or is cancelled.
-fn start_key_learn() -> (mpsc::Receiver<(String, String)>, Vec<DeviceReader>) {
+/// When `profile_mod_keys` is empty every key is treated as a plain key and
+/// the first press is returned immediately.
+///
+/// A 150 ms timestamp gate on non-modifier presses prevents the click that
+/// opened the learn dialog from being captured.  Modifier tracking has no gate
+/// so the user can hold a modifier immediately after clicking.
+fn start_key_learn(profile_mod_keys: Vec<String>) -> (mpsc::Receiver<(String, String)>, Vec<DeviceReader>) {
+    use std::sync::{Arc, Mutex};
+
     let (tx, rx) = mpsc::channel::<(String, String)>();
     let threshold = std::time::SystemTime::now()
         + std::time::Duration::from_millis(150);
+    let mod_keys  = Arc::new(profile_mod_keys);
+    let held_mods: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
     let handles: Vec<DeviceReader> = evdev::enumerate()
         .map(|(_, mut device)| {
             let device_name = device.name().unwrap_or("Unknown").to_string();
-            let tx   = tx.clone();
+            let tx        = tx.clone();
+            let mod_keys  = mod_keys.clone();
+            let held_mods = held_mods.clone();
             let (handle, cancel) = DeviceReader::new_with_cancel();
 
             std::thread::spawn(move || {
@@ -1885,11 +1861,28 @@ fn start_key_learn() -> (mpsc::Receiver<(String, String)>, Vec<DeviceReader>) {
                     let Ok(events) = device.fetch_events() else { break };
                     for event in events {
                         if !cancel.load(Ordering::Relaxed) { return; }
-                        if event.timestamp() < threshold { continue; }
                         if let evdev::InputEventKind::Key(key) = event.kind() {
-                            if event.value() == 1 {
-                                let _ = tx.send((crate::engine::key_name(key), device_name.clone()));
-                                return; // this thread is done; others still cancel via handle drop
+                            let name = crate::engine::key_name(key);
+                            if mod_keys.contains(&name) {
+                                // Track held state across all devices; no timestamp gate.
+                                let mut mods = held_mods.lock().unwrap();
+                                if event.value() == 1 {
+                                    if !mods.contains(&name) { mods.push(name); }
+                                } else if event.value() == 0 {
+                                    mods.retain(|m| m != &name);
+                                }
+                            } else if event.value() == 1 {
+                                if event.timestamp() < threshold { continue; }
+                                let mods = held_mods.lock().unwrap().clone();
+                                let result = if mods.is_empty() {
+                                    name
+                                } else {
+                                    let mut parts = mods;
+                                    parts.push(name);
+                                    parts.join("+")
+                                };
+                                let _ = tx.send((result, device_name.clone()));
+                                return;
                             }
                         }
                     }
@@ -1988,11 +1981,21 @@ impl eframe::App for ProfileApp {
             if matches!(self.learn_target, Some(LearnTarget::AssignmentSource(usize::MAX))) {
                 self.learn_target  = None;
                 self.learn_handles = Vec::new(); // stop remaining reader threads
-                if let Some(msg) = self.assignment_guard(&key, &[], Some(&device), &TriggerMode::Any, usize::MAX) {
+                let parts: Vec<&str> = key.split('+').collect();
+                let actual_key = parts.last().copied().unwrap_or(&key).to_string();
+                let held_names: &[&str] = if parts.len() > 1 { &parts[..parts.len()-1] } else { &[] };
+                let mod_uuids: Vec<Uuid> = self.profile()
+                    .map(|p| p.modifiers.iter()
+                        .filter(|m| held_names.contains(&m.key.as_str()))
+                        .map(|m| m.id)
+                        .collect())
+                    .unwrap_or_default();
+                if let Some(msg) = self.assignment_guard(&actual_key, &mod_uuids, Some(&device), &TriggerMode::Any, usize::MAX) {
                     self.warn_popup = Some(msg);
                 } else if let Some(p) = self.profile_mut() {
-                    let mut a = KeyAssignment::new(key);
+                    let mut a = KeyAssignment::new(actual_key);
                     a.source_device = Some(device);
+                    a.modifiers     = mod_uuids;
                     p.assignments.push(a);
                     store::save_profile(p);
                 }

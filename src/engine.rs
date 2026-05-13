@@ -272,9 +272,11 @@ async fn start_session(uuid: Uuid) -> Result<ActiveSession, String> {
     }
     for assignment in &profile.assignments {
         if let Some(remap_name) = &assignment.remap_key {
-            if let Some(key) = parse_key(remap_name) {
-                vdev_keys.insert(key);
-                has_keys = true;
+            for part in remap_name.split('+') {
+                if let Some(key) = parse_key(part.trim()) {
+                    vdev_keys.insert(key);
+                    has_keys = true;
+                }
             }
         }
     }
@@ -407,13 +409,16 @@ async fn run_event_processor(
     profile: Profile,
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
-    let mod_by_name: HashMap<String, Uuid> = profile.modifiers.iter()
-        .map(|m| (m.key.clone(), m.id))
-        .collect();
+    let find_mod = |key_name: &str, dev_name: &str| -> Option<Uuid> {
+        profile.modifiers.iter().find(|m| {
+            m.key == key_name
+                && m.source_device.as_deref().map_or(true, |d| d == dev_name)
+        }).map(|m| m.id)
+    };
 
     let mut held_mods:    HashSet<Uuid> = HashSet::new();
-    // source key code → remapped Key currently held down
-    let mut active_remaps: HashMap<u16, Key> = HashMap::new();
+    // source key code → remapped keys currently held down (may be a modifier+key compound)
+    let mut active_remaps: HashMap<u16, Vec<Key>> = HashMap::new();
     // source key code → loop entry (abort handle, release keys, cycle count, end events)
     let mut active_loops: HashMap<u16, ActiveLoopEntry> = HashMap::new();
     // source key code → (press instant, device name, mods held at press) for QuickPress/ShortHold
@@ -456,7 +461,7 @@ async fn run_event_processor(
                 if value == 0 {
                     // Release: cancel any active remap/loop unconditionally,
                     // regardless of current modifier state.
-                    if let Some(&mod_id) = mod_by_name.get(&name) {
+                    if let Some(mod_id) = find_mod(&name, &device_name) {
                         held_mods.remove(&mod_id);
                         continue;
                     }
@@ -475,8 +480,10 @@ async fn run_event_processor(
                         }
                         continue;
                     }
-                    if let Some(rkey) = active_remaps.remove(&code) {
-                        emit_key(&vdev, rkey, 0);
+                    if let Some(rkeys) = active_remaps.remove(&code) {
+                        for rkey in rkeys.iter().rev() {
+                            emit_key(&vdev, *rkey, 0);
+                        }
                         continue;
                     }
                     if let Some(entry) = active_loops.remove(&code) {
@@ -495,7 +502,7 @@ async fn run_event_processor(
 
                 if value == 1 {
                     // Modifier key press.
-                    if let Some(&mod_id) = mod_by_name.get(&name) {
+                    if let Some(mod_id) = find_mod(&name, &device_name) {
                         held_mods.insert(mod_id);
                         continue;
                     }
@@ -503,9 +510,12 @@ async fn run_event_processor(
                     // Immediate-fire assignment: remaps (any trigger_mode) or Any-mode macros.
                     if let Some(assignment) = find_assignment(&profile, &name, &held_mods, &device_name) {
                         if let Some(remap_name) = assignment.remap_key.clone() {
-                            if let Some(rkey) = parse_key(&remap_name) {
-                                emit_key(&vdev, rkey, 1);
-                                active_remaps.insert(code, rkey);
+                            let rkeys: Vec<Key> = remap_name.split('+')
+                                .filter_map(|part| parse_key(part.trim()))
+                                .collect();
+                            if !rkeys.is_empty() {
+                                for &rkey in &rkeys { emit_key(&vdev, rkey, 1); }
+                                active_remaps.insert(code, rkeys);
                             }
                         } else if let Some(macro_id) = assignment.macro_id {
                             if let Some(mac) = profile.macros.iter().find(|m| m.id == macro_id) {
@@ -581,8 +591,10 @@ async fn run_event_processor(
         }
         // Do NOT fire end events on graceful stop (session end, not key release).
     }
-    for (_, rkey) in active_remaps.drain() {
-        emit_key(&vdev, rkey, 0);
+    for (_, rkeys) in active_remaps.drain() {
+        for rkey in rkeys.iter().rev() {
+            emit_key(&vdev, *rkey, 0);
+        }
     }
 }
 

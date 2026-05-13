@@ -89,13 +89,16 @@ pub struct ModifierKey {
     pub id: Uuid,
     /// evdev key name, e.g. "KEY_LEFTALT"
     pub key: String,
-    /// User-visible label, e.g. "Alt"
+    /// User-visible label; defaults to the key name if not set.
     pub name: String,
+    /// evdev device name filter. None = any device.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub source_device: Option<String>,
 }
 
 impl ModifierKey {
     pub fn new(key: impl Into<String>, name: impl Into<String>) -> Self {
-        Self { id: Uuid::new_v4(), key: key.into(), name: name.into() }
+        Self { id: Uuid::new_v4(), key: key.into(), name: name.into(), source_device: None }
     }
 }
 
